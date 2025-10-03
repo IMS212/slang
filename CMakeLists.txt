@@ -1,5 +1,4 @@
 cmake_minimum_required(VERSION 3.22)
-
 # Our module dir, include that now so that we can get the version automatically
 # from git describe
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
@@ -35,7 +34,7 @@ set(CMAKE_BUILD_RPATH_USE_ORIGIN TRUE)
 
 # Export the compile datebase as a json file, this can be used by VIM language server
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
+set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 # Enable placing targets into a hierarchy for IDE generators
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
@@ -56,7 +55,8 @@ include(SlangTarget)
 include(AutoOption)
 include(GitHubRelease)
 include(FetchedSharedLibrary)
-
+include(CheckIPOSupported)
+check_ipo_supported(RESULT supported OUTPUT error)
 #
 # Options
 #
@@ -502,6 +502,7 @@ add_subdirectory(source/slang-glsl-module)
 add_subdirectory(source/slang)
 add_subdirectory(source/slangc)
 add_subdirectory(examples)
+set_property(GLOBAL PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 
 #
 # Packaging

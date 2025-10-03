@@ -353,7 +353,7 @@ String CLikeSourceEmitter::getTargetBuiltinVarName(IRInst* inst, IRTargetBuiltin
     case IRTargetBuiltinVarName::SpvBaseInstance:
         return "gl_BaseInstance";
     case IRTargetBuiltinVarName::SpvVertexIndex:
-        return "gl_VertexIndex";
+        return "gl_VertexID";
     case IRTargetBuiltinVarName::SpvBaseVertex:
         return "gl_BaseVertex";
     }

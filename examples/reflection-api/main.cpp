@@ -1491,7 +1491,7 @@ struct ExampleProgram : public TestBase
     }
 };
 
-int exampleMain(int argc, char** argv)
+int main(int argc, char** argv)
 {
     ExampleProgram app;
     if (SLANG_FAILED(app.execute(argc, argv)))

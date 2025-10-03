@@ -1226,6 +1226,42 @@ static void addExplicitParameterBindings_GLSL(
                 info[kResInfo].semanticInfo.space = glslBindingAttr->set;
             }
         }
+        else if (auto foundDescriptorTableSlot =
+                typeLayout->FindResourceInfo(LayoutResourceKind::SamplerState))
+        {
+            foundResInfo = foundDescriptorTableSlot;
+            // Try to find `binding` and `set`
+            if (auto glslBindingAttr = varDecl.getDecl()->findModifier<GLSLBindingAttribute>())
+            {
+                info[kResInfo].resInfo = foundResInfo;
+                info[kResInfo].semanticInfo.index = glslBindingAttr->binding;
+                info[kResInfo].semanticInfo.space = glslBindingAttr->set;
+            }
+        }
+        else if (auto foundDescriptorTableSlot =
+                typeLayout->FindResourceInfo(LayoutResourceKind::UnorderedAccess))
+        {
+            foundResInfo = foundDescriptorTableSlot;
+            // Try to find `binding` and `set`
+            if (auto glslBindingAttr = varDecl.getDecl()->findModifier<GLSLBindingAttribute>())
+            {
+                info[kResInfo].resInfo = foundResInfo;
+                info[kResInfo].semanticInfo.index = glslBindingAttr->binding;
+                info[kResInfo].semanticInfo.space = glslBindingAttr->set;
+            }
+        }
+        else if (auto foundDescriptorTableSlot =
+                typeLayout->FindResourceInfo(LayoutResourceKind::ConstantBuffer))
+        {
+            foundResInfo = foundDescriptorTableSlot;
+            // Try to find `binding` and `set`
+            if (auto glslBindingAttr = varDecl.getDecl()->findModifier<GLSLBindingAttribute>())
+            {
+                info[kResInfo].resInfo = foundResInfo;
+                info[kResInfo].semanticInfo.index = glslBindingAttr->binding;
+                info[kResInfo].semanticInfo.space = glslBindingAttr->set;
+            }
+        }
         else if (
             auto foundSubElementRegisterSpace =
                 typeLayout->FindResourceInfo(LayoutResourceKind::SubElementRegisterSpace))

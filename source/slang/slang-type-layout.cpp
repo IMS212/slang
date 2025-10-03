@@ -838,6 +838,14 @@ struct GLSLObjectLayoutRulesImpl : ObjectLayoutRulesImpl
             return SimpleLayoutInfo(LayoutResourceKind::InputAttachmentIndex, slotCount);
         case ShaderParameterKind::ParameterBlock:
             return SimpleLayoutInfo(LayoutResourceKind::SubElementRegisterSpace, 1);
+        case ShaderParameterKind::ConstantBuffer:
+            return SimpleLayoutInfo(LayoutResourceKind::ConstantBuffer, slotCount);
+        case ShaderParameterKind::TextureSampler:
+            return SimpleLayoutInfo(LayoutResourceKind::SamplerState, slotCount);
+        case ShaderParameterKind::Image:
+        case ShaderParameterKind::MutableImage:
+        case ShaderParameterKind::MutableTexture:
+            return SimpleLayoutInfo(LayoutResourceKind::UnorderedAccess, slotCount);
         default:
             break;
         }
@@ -2617,7 +2625,7 @@ static SimpleLayoutInfo _getParameterGroupLayoutInfo(
 static bool isOpenGLTarget(TargetRequest*)
 {
     // We aren't officially supporting OpenGL right now
-    return false;
+    return true;
 }
 
 bool isD3DTarget(TargetRequest* targetReq)

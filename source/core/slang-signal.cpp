@@ -58,6 +58,8 @@ String _getMessage(SignalType type, char const* message)
 
     g_lastSignalMessage = _getMessage(type, message);
 
+    printf(_getMessage(type, message).getBuffer());
+
 #if SLANG_HAS_EXCEPTIONS
     switch (type)
     {

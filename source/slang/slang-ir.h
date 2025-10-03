@@ -705,6 +705,7 @@ struct IRInst
     IRInst* getOperand(UInt index)
     {
         SLANG_ASSERT(index < getOperandCount());
+
         return getOperands()[index].get();
     }
 
