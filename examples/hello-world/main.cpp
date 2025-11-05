@@ -14,6 +14,7 @@
 #include "slang.h"
 #include "vulkan-api.h"
 
+#include <filesystem>
 #include <fstream>
 
 using Slang::ComPtr;
@@ -190,22 +191,22 @@ int HelloWorldExample::createComputePipelineFromShader()
     slang::IModule* slangModule2 = nullptr;
     slang::IModule* slangModule3 = nullptr;
     {
-        constexpr bool USE_IR = true;
+        constexpr bool USE_IR = false;
         ComPtr<slang::IBlob> diagnosticBlob;
 
         ISlangBlob* blob2 = nullptr;
         if (USE_IR)
         {
-            auto blob = getFile("/home/ims/CLionProjects/slang-unmodified/examples/hello-world/aperture.slang-module");
+            auto blob = getFile((resourceBase.resolveResource("aperture.slang-module").begin()));
             if (!blob) return -1;
             slangModule = session->loadModuleFromIRBlob("aperture", "aperture.slang", blob, diagnosticBlob.writeRef());
         } else
         {
-            auto blob = getFile("/home/ims/CLionProjects/slang-unmodified/examples/hello-world/aperture.slang");
+            auto blob = getFile(resourceBase.resolveResource("aperture.slang").begin());
             if (!blob) return -1;
             slangModule = session->loadModuleFromSource("aperture", "aperture.slang", blob, diagnosticBlob.writeRef());
             slangModule->serialize(&blob2);
-            writeFile("/home/ims/CLionProjects/slang-unmodified/examples/hello-world/aperture.slang-module", blob2);
+            writeFile((resourceBase.resolveResource("aperture.slang") + "-module").begin(), blob2);
         }
 
         blob2 = nullptr;
@@ -213,21 +214,21 @@ int HelloWorldExample::createComputePipelineFromShader()
         diagnoseIfNeeded(diagnosticBlob);
         if (USE_IR)
         {
-            auto blob = getFile("/home/ims/CLionProjects/slang-unmodified/examples/hello-world/internal.vanilla.slang-module");
+            auto blob = getFile(resourceBase.resolveResource("internal.vanilla.slang").begin());
             if (!blob) return -1;
             slangModule2 = session->loadModuleFromIRBlob("vanilla", "internal/vanilla.slang", blob, diagnosticBlob.writeRef());
         } else
         {
-            auto blob = getFile("/home/ims/CLionProjects/slang-unmodified/examples/hello-world/internal.vanilla.slang");
+            auto blob = getFile(resourceBase.resolveResource("internal.vanilla.slang").begin());
             if (!blob) return -1;
             slangModule2 = session->loadModuleFromSource("vanilla", "internal/vanilla.slang", blob, diagnosticBlob.writeRef());
             slangModule2->serialize(&blob2);
-            writeFile("/home/ims/CLionProjects/slang-unmodified/examples/hello-world/internal.vanilla.slang-module", blob2);
+            writeFile((resourceBase.resolveResource("internal.vanilla.slang") + "-module").begin(), blob2);
         }
         diagnoseIfNeeded(diagnosticBlob);
 
         {
-            auto blob = getFile("/home/ims/CLionProjects/slang-unmodified/examples/hello-world/test.slang");
+            auto blob = getFile(resourceBase.resolveResource("test.slang").begin());
             if (!blob) return -1;
             slangModule3 = session->loadModuleFromSource("test", "test.slang", blob, diagnosticBlob.writeRef());
         }
@@ -308,7 +309,7 @@ int HelloWorldExample::createComputePipelineFromShader()
         printf("Passed 3\n");
 
         std::ofstream outputFile;
-        outputFile.open("/home/ims/CLionProjects/slang-unmodified/examples/hello-world/example.txt", std::ios::binary);
+        outputFile.open(resourceBase.resolveResource("example.txt").begin(), std::ios::binary);
         printf("Passed 4\n");
 
         if (outputFile.is_open()) {

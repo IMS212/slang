@@ -7,6 +7,7 @@ function(example dir)
         GLOB asset_files
         CONFIGURE_DEPENDS
         "${dir}/*.slang"
+        "${dir}/*.slang-module"
         "${dir}/*.jpg"
         "${dir}/*.obj"
         "${dir}/*.mtl"
