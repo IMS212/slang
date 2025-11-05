@@ -14,6 +14,8 @@
 #include "slang.h"
 #include "vulkan-api.h"
 
+#include <fstream>
+
 using Slang::ComPtr;
 
 static const ExampleResources resourceBase("hello-world");
@@ -67,7 +69,7 @@ struct HelloWorldExample : public TestBase
 };
 
 
-int exampleMain(int argc, char** argv)
+int main (int argc, char** argv)
 {
     HelloWorldExample example;
     example.parseOption(argc, argv);
@@ -110,6 +112,48 @@ int HelloWorldExample::initVulkanInstanceAndDevice()
     return 0;
 }
 
+slang::IBlob* getFile(const char* name)
+{
+    std::ifstream infile(name, std::ios::binary);
+    if (!infile.is_open())
+    {
+        fprintf(stderr, "Failed to open file: %s\n", name);
+        return nullptr;
+    }
+    // Get length of file
+    infile.seekg(0, std::ios::end);
+    std::streamoff length = infile.tellg();
+    if (length <= 0)
+    {
+        fprintf(stderr, "Empty or invalid file: %s\n", name);
+        return nullptr;
+    }
+    infile.seekg(0, std::ios::beg);
+    void* buffer = malloc(static_cast<size_t>(length));
+    if (!buffer)
+    {
+        fprintf(stderr, "Out of memory reading: %s\n", name);
+        return nullptr;
+    }
+    // Read file
+    infile.read(static_cast<char*>(buffer), length);
+    if (!infile)
+    {
+        fprintf(stderr, "Failed to read file: %s\n", name);
+        free(buffer);
+        return nullptr;
+    }
+
+    return slang_createBlob(buffer, static_cast<size_t>(length));
+}
+void writeFile(const char* str, ISlangBlob* blob2)
+{
+    std::ofstream outputFile;
+    outputFile.open(str, std::ios::binary);
+    outputFile.write(
+        static_cast<const std::ostream::char_type*>(blob2->getBufferPointer()), blob2->getBufferSize());
+    outputFile.close();
+}
 int HelloWorldExample::createComputePipelineFromShader()
 {
     // First we need to create slang global session with work with the Slang API.
@@ -119,8 +163,8 @@ int HelloWorldExample::createComputePipelineFromShader()
     // Next we create a compilation session to generate SPIRV code from Slang source.
     slang::SessionDesc sessionDesc = {};
     slang::TargetDesc targetDesc = {};
-    targetDesc.format = SLANG_SPIRV;
-    targetDesc.profile = slangGlobalSession->findProfile("spirv_1_5");
+    targetDesc.format = SLANG_GLSL;
+    targetDesc.profile = slangGlobalSession->findProfile("glsl_460");
     targetDesc.flags = 0;
 
 
@@ -143,14 +187,54 @@ int HelloWorldExample::createComputePipelineFromShader()
     // `hello-world.slang`, then compile and load that file. If a matching module had
     // already been loaded previously, that would be used directly.
     slang::IModule* slangModule = nullptr;
+    slang::IModule* slangModule2 = nullptr;
+    slang::IModule* slangModule3 = nullptr;
     {
+        constexpr bool USE_IR = true;
         ComPtr<slang::IBlob> diagnosticBlob;
-        Slang::String path = resourceBase.resolveResource("hello-world.slang");
-        slangModule = session->loadModule(path.getBuffer(), diagnosticBlob.writeRef());
+
+        ISlangBlob* blob2 = nullptr;
+        if (USE_IR)
+        {
+            auto blob = getFile("/home/ims/CLionProjects/slang-unmodified/examples/hello-world/aperture.slang-module");
+            if (!blob) return -1;
+            slangModule = session->loadModuleFromIRBlob("aperture", "aperture.slang", blob, diagnosticBlob.writeRef());
+        } else
+        {
+            auto blob = getFile("/home/ims/CLionProjects/slang-unmodified/examples/hello-world/aperture.slang");
+            if (!blob) return -1;
+            slangModule = session->loadModuleFromSource("aperture", "aperture.slang", blob, diagnosticBlob.writeRef());
+            slangModule->serialize(&blob2);
+            writeFile("/home/ims/CLionProjects/slang-unmodified/examples/hello-world/aperture.slang-module", blob2);
+        }
+
+        blob2 = nullptr;
+
         diagnoseIfNeeded(diagnosticBlob);
-        if (!slangModule)
-            return -1;
+        if (USE_IR)
+        {
+            auto blob = getFile("/home/ims/CLionProjects/slang-unmodified/examples/hello-world/internal.vanilla.slang-module");
+            if (!blob) return -1;
+            slangModule2 = session->loadModuleFromIRBlob("vanilla", "internal/vanilla.slang", blob, diagnosticBlob.writeRef());
+        } else
+        {
+            auto blob = getFile("/home/ims/CLionProjects/slang-unmodified/examples/hello-world/internal.vanilla.slang");
+            if (!blob) return -1;
+            slangModule2 = session->loadModuleFromSource("vanilla", "internal/vanilla.slang", blob, diagnosticBlob.writeRef());
+            slangModule2->serialize(&blob2);
+            writeFile("/home/ims/CLionProjects/slang-unmodified/examples/hello-world/internal.vanilla.slang-module", blob2);
+        }
+        diagnoseIfNeeded(diagnosticBlob);
+
+        {
+            auto blob = getFile("/home/ims/CLionProjects/slang-unmodified/examples/hello-world/test.slang");
+            if (!blob) return -1;
+            slangModule3 = session->loadModuleFromSource("test", "test.slang", blob, diagnosticBlob.writeRef());
+        }
+        diagnoseIfNeeded(diagnosticBlob);
     }
+
+    printf("Passed\n");
 
     // Loading the `hello-world` module will compile and check all the shader code in it,
     // including the shader entry points we want to use. Now that the module is loaded
@@ -163,7 +247,9 @@ int HelloWorldExample::createComputePipelineFromShader()
     // points when it parses your code via `loadModule()`.
     //
     ComPtr<slang::IEntryPoint> entryPoint;
-    slangModule->findEntryPointByName("computeMain", entryPoint.writeRef());
+    ComPtr<slang::IEntryPoint> entryPoint2;
+    slangModule3->findEntryPointByName("vertexMain", entryPoint.writeRef());
+    slangModule3->findEntryPointByName("fragmentMain", entryPoint2.writeRef());
 
     // At this point we have a few different Slang API objects that represent
     // pieces of our code: `module`, `vertexEntryPoint`, and `fragmentEntryPoint`.
@@ -180,7 +266,11 @@ int HelloWorldExample::createComputePipelineFromShader()
     //
     Slang::List<slang::IComponentType*> componentTypes;
     componentTypes.add(slangModule);
+    componentTypes.add(slangModule2);
+    componentTypes.add(slangModule3);
     componentTypes.add(entryPoint);
+    // Optionally include the fragment entry point as well if desired.
+    // componentTypes.add(entryPoint2);
 
     // Actually creating the composite component type is a single operation
     // on the Slang session, but the operation could potentially fail if
@@ -200,6 +290,8 @@ int HelloWorldExample::createComputePipelineFromShader()
         RETURN_ON_FAIL(result);
     }
 
+    printf("Passed 2\n");
+
     // Now we can call `composedProgram->getEntryPointCode()` to retrieve the
     // compiled SPIRV code that we will use to create a vulkan compute pipeline.
     // This will trigger the final Slang compilation and spirv code generation.
@@ -213,12 +305,37 @@ int HelloWorldExample::createComputePipelineFromShader()
             diagnosticsBlob.writeRef());
         diagnoseIfNeeded(diagnosticsBlob);
         RETURN_ON_FAIL(result);
+        printf("Passed 3\n");
+
+        std::ofstream outputFile;
+        outputFile.open("/home/ims/CLionProjects/slang-unmodified/examples/hello-world/example.txt", std::ios::binary);
+        printf("Passed 4\n");
+
+        if (outputFile.is_open()) {
+            // Write data to the file using the insertion operator (<<)
+            outputFile.write(
+                static_cast<const std::ostream::char_type*>(spirvCode->getBufferPointer()), spirvCode->getBufferSize());
+            printf("Passed 5\n");
+
+            // Close the file
+            outputFile.close();
+            printf("Data successfully written to example.txt\n");
+        } else {
+            printf("Failed 4\n");
+
+            std::cerr << "Error opening file!" << std::endl;
+        }
+
+        std::flush(std::cout);
 
         if (isTestMode())
         {
             printEntrypointHashes(1, 1, composedProgram);
         }
     }
+
+    return 0;
+    std::abort();
 
     // The following steps are all Vulkan API calls to create a pipeline.
 
