@@ -191,7 +191,7 @@ int HelloWorldExample::createComputePipelineFromShader()
     slang::IModule* slangModule2 = nullptr;
     slang::IModule* slangModule3 = nullptr;
     {
-        constexpr bool USE_IR = false;
+        constexpr bool USE_IR = true;
         ComPtr<slang::IBlob> diagnosticBlob;
 
         ISlangBlob* blob2 = nullptr;
@@ -214,7 +214,7 @@ int HelloWorldExample::createComputePipelineFromShader()
         diagnoseIfNeeded(diagnosticBlob);
         if (USE_IR)
         {
-            auto blob = getFile(resourceBase.resolveResource("internal.vanilla.slang").begin());
+            auto blob = getFile(resourceBase.resolveResource("internal.vanilla.slang-module").begin());
             if (!blob) return -1;
             slangModule2 = session->loadModuleFromIRBlob("vanilla", "internal/vanilla.slang", blob, diagnosticBlob.writeRef());
         } else
