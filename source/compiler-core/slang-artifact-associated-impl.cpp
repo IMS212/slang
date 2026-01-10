@@ -344,5 +344,11 @@ const char* ArtifactPostEmitMetadata::getDebugBuildIdentifier()
     return m_debugBuildIdentifier.getBuffer();
 }
 
+Slice<BindlessResourceInfo> ArtifactPostEmitMetadata::getBindlessConvertedResources()
+{
+    return Slice<BindlessResourceInfo>(
+        m_bindlessConvertedResources.getBuffer(),
+        m_bindlessConvertedResources.getCount());
+}
 
 } // namespace Slang

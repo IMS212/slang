@@ -107,6 +107,8 @@ ISlangUnknown* ComponentType::getInterface(Guid const& guid)
         return static_cast<slang::IModulePrecompileService_Experimental*>(this);
     if (guid == IComponentType2::getTypeGuid())
         return static_cast<slang::IComponentType2*>(this);
+    if (guid == IComponentType3::getTypeGuid())
+        return static_cast<slang::IComponentType3*>(this);
     return nullptr;
 }
 
@@ -546,6 +548,29 @@ SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::getTargetCompileResult(
 
     *outCompileResult = static_cast<slang::ICompileResult*>(artifact);
     (*outCompileResult)->addRef();
+    return SLANG_OK;
+}
+
+SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::setBindlessResourceIndexMap(
+    Int targetIndex,
+    const char* const* names,
+    const SlangInt* indices,
+    SlangInt count)
+{
+    auto linkage = getLinkage();
+    if (targetIndex < 0 || targetIndex >= linkage->targets.getCount())
+        return SLANG_E_INVALID_ARG;
+    
+    auto target = linkage->targets[targetIndex];
+    auto targetProgram = getTargetProgram(target);
+    
+    Dictionary<String, int> map;
+    for (SlangInt i = 0; i < count; i++)
+    {
+        map.set(String(names[i]), (int)indices[i]);
+    }
+    targetProgram->setBindlessResourceIndexMap(map);
+    
     return SLANG_OK;
 }
 

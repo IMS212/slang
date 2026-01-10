@@ -191,6 +191,8 @@ public:
         SLANG_OVERRIDE;
     SLANG_NO_THROW virtual Slice<String> SLANG_MCALL getExportedFunctionMangledNames()
         SLANG_OVERRIDE;
+    SLANG_NO_THROW virtual Slice<BindlessResourceInfo> SLANG_MCALL getBindlessConvertedResources()
+        SLANG_OVERRIDE;
 
     // IMetadata
     SLANG_NO_THROW virtual SlangResult isParameterLocationUsed(
@@ -212,6 +214,8 @@ public:
     List<ShaderBindingRange> m_usedBindings;
     List<String> m_exportedFunctionMangledNames;
     String m_debugBuildIdentifier;
+    List<BindlessResourceInfo> m_bindlessConvertedResources;
+    SliceAllocator m_bindlessAllocator;
 };
 
 } // namespace Slang

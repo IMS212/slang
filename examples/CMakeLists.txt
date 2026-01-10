@@ -109,6 +109,7 @@ if(SLANG_ENABLE_EXAMPLES AND SLANG_ENABLE_SLANG_RHI)
     # Add individual examples as subdirectories
     #
     add_subdirectory(autodiff-texture)
+    add_subdirectory(bindless-resources)
     add_subdirectory(cpu-com-example)
     add_subdirectory(cpu-hello-world)
     add_subdirectory(gpu-printing)

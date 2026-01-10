@@ -111,6 +111,21 @@ public:
         return isSPIRV(m_targetReq->getTarget()) && getOptionSet().shouldEmitSPIRVDirectly();
     }
 
+    /// Set the resource name to bindless index mapping.
+    /// Resources matching names in this map will be converted to
+    /// DescriptorHandle lookups from an index buffer at set 1, binding 3.
+    void setBindlessResourceIndexMap(const Dictionary<String, int>& map)
+    {
+        m_bindlessResourceIndexMap = map;
+    }
+
+    /// Get the bindless resource index map.
+    Dictionary<String, int>& getBindlessResourceIndexMap() { return m_bindlessResourceIndexMap; }
+
+    /// Map of resource names to bindless indices for conversion.
+    /// This is public so IR passes can access it directly.
+    Dictionary<String, int> m_bindlessResourceIndexMap;
+
 private:
     RefPtr<IRModule> createIRModuleForLayout(DiagnosticSink* sink);
 

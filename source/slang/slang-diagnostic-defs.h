@@ -2636,6 +2636,12 @@ DIAGNOSTIC(
     "comma operator used in expression (may be unintended)")
 
 DIAGNOSTIC(
+    41025,
+    Warning,
+    resourceNotInBindlessMap,
+    "resource '$0' is used but not found in bindless resource index map")
+
+DIAGNOSTIC(
     41024,
     Error,
     cannotDefaultInitializeResource,

@@ -4696,6 +4696,38 @@ struct IComponentType2 : public ISlangUnknown
 };
     #define SLANG_UUID_IComponentType2 IComponentType2::getTypeGuid()
 
+/** IComponentType3 provides support for bindless resource lowering.
+
+This interface allows setting a map from resource names to bindless index buffer indices.
+When set, the compiler will convert resources to use DescriptorHandle<T> with indices
+loaded from a StructuredBuffer<uint2> at set 1, binding 3.
+
+The map should be set before calling link() or getEntryPointCode().
+*/
+struct IComponentType3 : public ISlangUnknown
+{
+    SLANG_COM_INTERFACE(
+        0x7b3e5c2a,
+        0x1d8f,
+        0x4a92,
+        {0xb6, 0x43, 0x9e, 0x72, 0x1c, 0xa8, 0x5d, 0x2b})
+
+    /** Set the bindless resource index map for a specific target.
+    
+    @param targetIndex The target index to configure
+    @param names Array of resource names
+    @param indices Array of index values corresponding to each name
+    @param count Number of entries in the arrays
+    @return SLANG_OK on success
+    */
+    virtual SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessResourceIndexMap(
+        SlangInt targetIndex,
+        const char* const* names,
+        const SlangInt* indices,
+        SlangInt count) = 0;
+};
+    #define SLANG_UUID_IComponentType3 IComponentType3::getTypeGuid()
+
 /** A module is the granularity of shader code compilation and loading.
 
 In most cases a module corresponds to a single compile "translation unit."

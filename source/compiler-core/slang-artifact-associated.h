@@ -124,6 +124,14 @@ public:
 
 struct ShaderBindingRange;
 
+/// Information about a resource that was converted to bindless access.
+struct BindlessResourceInfo
+{
+    TerminatedCharSlice name;     ///< Original resource name
+    TerminatedCharSlice typeName; ///< Type of the resource (e.g., "Texture2D", "RWStructuredBuffer")
+    SlangInt index;               ///< Index in the bindless index buffer
+};
+
 class IArtifactPostEmitMetadata : public slang::IMetadata
 {
 public:
@@ -141,6 +149,9 @@ public:
 
     /// Get the debug build identifier for a base and debug spirv pair
     SLANG_NO_THROW virtual const char* SLANG_MCALL getDebugBuildIdentifier() = 0;
+
+    /// Get information about resources converted to bindless access.
+    SLANG_NO_THROW virtual Slice<BindlessResourceInfo> SLANG_MCALL getBindlessConvertedResources() = 0;
 };
 
 } // namespace Slang

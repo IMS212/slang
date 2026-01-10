@@ -80,6 +80,7 @@
 #include "slang-ir-lower-combined-texture-sampler.h"
 #include "slang-ir-lower-coopvec.h"
 #include "slang-ir-lower-dynamic-dispatch-insts.h"
+#include "slang-ir-lower-bindless-resources.h"
 #include "slang-ir-lower-dynamic-resource-heap.h"
 #include "slang-ir-lower-enum-type.h"
 #include "slang-ir-lower-glsl-ssbo-types.h"
@@ -712,6 +713,9 @@ Result linkAndOptimizeIR(
     auto irModule = outLinkedIR.module;
     auto irEntryPoints = outLinkedIR.entryPoints;
 
+    // Storage for resources converted to bindless access (populated by lowerBindlessResources pass)
+    List<BindlessConvertedResource> bindlessConvertedResources;
+
     // For now, only emit the debug build identifier if separate debug info is enabled
     // and only if there are targets.
     // TODO: We will ultimately need to change this to always emit the instruction.
@@ -758,7 +762,6 @@ Result linkAndOptimizeIR(
     //
     SLANG_PASS(replaceGlobalConstants);
     validateIRModuleIfEnabled(codeGenContext, irModule);
-
 
     // When there are top-level existential-type parameters
     // to the shader, we need to take the side-band information
@@ -1363,6 +1366,18 @@ Result linkAndOptimizeIR(
         // then become multiple variables/parameters/arguments/etc.
         //
         SLANG_PASS(legalizeResourceTypes, targetProgram, sink);
+
+        // Lower global resources to bindless descriptor handles if configured.
+        // This runs after legalizeResourceTypes so that resources hoisted from
+        // structs (e.g., "materialTextures_diffuse" from MaterialTextures.diffuse)
+        // are available as individual global params that can be matched.
+        if (targetProgram->m_bindlessResourceIndexMap.getCount() > 0)
+        {
+            SLANG_PASS(lowerBindlessResources, targetProgram, sink, &bindlessConvertedResources);
+            // The bindless pass creates GetDynamicResourceHeap instructions at module scope
+            // which need to be lowered to actual resource heap global params.
+            SLANG_PASS(lowerDynamicResourceHeap, targetProgram, sink);
+        }
 
         // We also need to legalize empty types for Metal targets.
         switch (target)
@@ -2041,6 +2056,16 @@ Result linkAndOptimizeIR(
     }
 
     SLANG_PASS(collectMetadata, *metadata);
+
+    // Copy bindless converted resources to metadata
+    for (const auto& res : bindlessConvertedResources)
+    {
+        BindlessResourceInfo info;
+        info.name = metadata->m_bindlessAllocator.allocate(res.name.getUnownedSlice());
+        info.typeName = metadata->m_bindlessAllocator.allocate(res.typeName.getUnownedSlice());
+        info.index = res.index;
+        metadata->m_bindlessConvertedResources.add(info);
+    }
 
     outLinkedIR.metadata = metadata;
 

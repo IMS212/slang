@@ -97,6 +97,7 @@ private:
 class ComponentType : public RefObject,
                       public slang::IComponentType,
                       public slang::IComponentType2,
+                      public slang::IComponentType3,
                       public slang::IModulePrecompileService_Experimental
 {
 public:
@@ -184,6 +185,15 @@ public:
         SlangInt targetIndex,
         slang::ICompileResult** outCompileResult,
         slang::IBlob** outDiagnostics = nullptr) SLANG_OVERRIDE;
+
+    //
+    // slang::IComponentType3 interface
+    //
+    SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessResourceIndexMap(
+        SlangInt targetIndex,
+        const char* const* names,
+        const SlangInt* indices,
+        SlangInt count) SLANG_OVERRIDE;
 
     //
     // slang::IModulePrecompileService interface
