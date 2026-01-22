@@ -268,6 +268,11 @@ static int glslang_optimizeSPIRV(
 
     spvtools::Optimizer optimizer(targetEnv);
 
+    // WORKAROUND: Disable ADCE to avoid crash in autodiff shaders (SPIRV-Tools commit 1c26ea1c)
+    // ADCE aggressively eliminates variables causing GPU crashes in autodiff shaders.
+    // See: https://github.com/shader-slang/slang/issues/9675
+    const bool enableADCE = false;
+
     auto messageConsumer = [&](spv_message_level_t level,
                                const char* source,
                                const spv_position_t& position,
@@ -288,7 +293,7 @@ static int glslang_optimizeSPIRV(
     };
     optimizer.SetMessageConsumer(messageConsumer);
 
-    // If debug info is being generated, propagate
+    // If debug info is being generated at Minimal level or above, propagate
     // line information into all SPIR-V instructions. This avoids loss of
     // information when instructions are deleted or moved. Later, remove
     // redundant information to minimize final SPRIR-V size.
@@ -351,7 +356,8 @@ static int glslang_optimizeSPIRV(
 
             optimizer.RegisterPass(spvtools::CreateEliminateDeadFunctionsPass()); // 3
 
-            optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
+            if (enableADCE)
+                optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
             optimizer.RegisterPass(spvtools::CreatePrivateToLocalPass());
 
             optimizer.RegisterPass(spvtools::CreateScalarReplacementPass(100));
@@ -365,7 +371,8 @@ static int glslang_optimizeSPIRV(
 
             optimizer.RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass()); // 8
 
-            optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
+            if (enableADCE)
+                optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
 
             optimizer.RegisterPass(spvtools::CreateVectorDCEPass()); // 9
 
@@ -420,7 +427,8 @@ static int glslang_optimizeSPIRV(
             // optimizer.RegisterPass(spvtools::CreateBlockMergePass());             // 8
             optimizer.RegisterPass(spvtools::CreateLocalAccessChainConvertPass());
             optimizer.RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass());
-            optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass()); // 5
+            if (enableADCE)
+                optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass()); // 5
             // optimizer.RegisterPass(spvtools::CreateCopyPropagateArraysPass());          // 1
             optimizer.RegisterPass(spvtools::CreateVectorDCEPass());
             optimizer.RegisterPass(spvtools::CreateDeadInsertElimPass());
@@ -430,7 +438,8 @@ static int glslang_optimizeSPIRV(
             // optimizer.RegisterPass(spvtools::CreateLocalMultiStoreElimPass());        // 2
             // optimizer.RegisterPass(spvtools::CreateRedundancyEliminationPass());
             optimizer.RegisterPass(spvtools::CreateSimplificationPass()); // 14
-            optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
+            if (enableADCE)
+                optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
             optimizer.RegisterPass(spvtools::CreateCFGCleanupPass());
 #endif
 
@@ -452,16 +461,19 @@ static int glslang_optimizeSPIRV(
             optimizer.RegisterPass(spvtools::CreateMergeReturnPass());
             optimizer.RegisterPass(spvtools::CreateInlineExhaustivePass());
             optimizer.RegisterPass(spvtools::CreateEliminateDeadFunctionsPass());
-            optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
+            if (enableADCE)
+                optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
             optimizer.RegisterPass(spvtools::CreatePrivateToLocalPass());
             optimizer.RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass());
             optimizer.RegisterPass(spvtools::CreateLocalSingleStoreElimPass());
-            optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
+            if (enableADCE)
+                optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
             optimizer.RegisterPass(spvtools::CreateScalarReplacementPass());
             optimizer.RegisterPass(spvtools::CreateLocalAccessChainConvertPass());
             optimizer.RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass());
             optimizer.RegisterPass(spvtools::CreateLocalSingleStoreElimPass());
-            optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
+            if (enableADCE)
+                optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
 
             // We run CompactIdsPass here, because CreateLocalMultiStoreElimPass can explode
             // id usage (by a factor of 10), and compacting ids here has been shown to half
@@ -471,9 +483,11 @@ static int glslang_optimizeSPIRV(
             // Note that CreateLocalMultiStoreElimPass really just does a SSARewritePass
             optimizer.RegisterPass(spvtools::CreateLocalMultiStoreElimPass());
 
-            optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
+            if (enableADCE)
+                optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
             optimizer.RegisterPass(spvtools::CreateCCPPass());
-            optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
+            if (enableADCE)
+                optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
             optimizer.RegisterPass(spvtools::CreateLoopUnrollPass(true));
             optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass());
             optimizer.RegisterPass(spvtools::CreateRedundancyEliminationPass());
@@ -483,9 +497,11 @@ static int glslang_optimizeSPIRV(
             optimizer.RegisterPass(spvtools::CreateLocalAccessChainConvertPass());
             optimizer.RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass());
             optimizer.RegisterPass(spvtools::CreateLocalSingleStoreElimPass());
-            optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
+            if (enableADCE)
+                optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
             optimizer.RegisterPass(spvtools::CreateSSARewritePass());
-            optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
+            if (enableADCE)
+                optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
             optimizer.RegisterPass(spvtools::CreateVectorDCEPass());
             optimizer.RegisterPass(spvtools::CreateDeadInsertElimPass());
             optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass());
@@ -493,7 +509,8 @@ static int glslang_optimizeSPIRV(
             optimizer.RegisterPass(spvtools::CreateIfConversionPass());
             optimizer.RegisterPass(spvtools::CreateCopyPropagateArraysPass());
             optimizer.RegisterPass(spvtools::CreateReduceLoadSizePass());
-            optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
+            if (enableADCE)
+                optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
             optimizer.RegisterPass(spvtools::CreateBlockMergePass());
             optimizer.RegisterPass(spvtools::CreateRedundancyEliminationPass());
             optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass());
@@ -776,16 +793,28 @@ static int glslang_compileGLSLToSPIRV(glslang_CompileRequest_1_2 request)
 
     const SlangDebugInfoLevel debugLevel = (SlangDebugInfoLevel)request.debugInfoType;
 
-    // Enable generation of debug info, if any debug level other than none is requested
-    if (debugLevel != SLANG_DEBUG_INFO_LEVEL_NONE)
+    // Configure debug info generation based on the requested level:
+    // - Minimal: Line numbers only (basic debug info for stack traces)
+    // - Standard: Full debug info including variables and types
+    // - Maximal: Everything including source code embedding and no optimization
+
+    if (debugLevel >= SLANG_DEBUG_INFO_LEVEL_MINIMAL)
     {
+        // Enable basic debug info for all levels (Minimal and above)
         spvOptions.generateDebugInfo = true;
-        spvOptions.emitNonSemanticShaderDebugInfo = true;
         shader->setDebugInfo(true);
+    }
+
+    if (debugLevel >= SLANG_DEBUG_INFO_LEVEL_STANDARD)
+    {
+        // Enable NonSemantic debug info for Standard and Maximal
+        // This includes variable names, types, and other rich debug information
+        spvOptions.emitNonSemanticShaderDebugInfo = true;
     }
 
     if (debugLevel == SLANG_DEBUG_INFO_LEVEL_MAXIMAL)
     {
+        // For Maximal, also embed source code and disable optimizations
         spvOptions.emitNonSemanticShaderDebugSource = true;
         spvOptions.disableOptimizer = true;
         request.optimizationLevel = SLANG_OPTIMIZATION_LEVEL_NONE;
