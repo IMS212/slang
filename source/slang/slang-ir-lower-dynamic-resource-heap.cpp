@@ -41,20 +41,6 @@ UInt findUnusedSpaceIndex(TargetProgram* targetProgram, IRModule* module, Diagno
         targetProgram->getOptionSet().getIntOption(CompilerOptionName::BindlessSpaceIndex);
     int availableIndex = requestedIndex;
 
-    while (usedSpaces.contains(availableIndex))
-    {
-        availableIndex++;
-    }
-
-    if (availableIndex != requestedIndex &&
-        targetProgram->getOptionSet().hasOption(CompilerOptionName::BindlessSpaceIndex))
-    {
-        sink->diagnose(
-            SourceLoc(),
-            Diagnostics::requestedBindlessSpaceIndexUnavailable,
-            requestedIndex,
-            availableIndex);
-    }
     return availableIndex;
 }
 
@@ -105,6 +91,7 @@ void lowerDynamicResourceHeap(IRModule* module, TargetProgram* targetProgram, Di
         builder.addLayoutDecoration(param, varLayout);
         builder.addNameHintDecoration(param, toSlice("__slang_resource_heap"));
         inst->replaceUsesWith(param);
+        inst->removeAndDeallocate();
     }
 }
 

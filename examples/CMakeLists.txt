@@ -136,3 +136,8 @@ if(SLANG_ENABLE_EXAMPLES AND SLANG_ENABLE_SLANG_RHI)
         add_subdirectory(mlp-training-coopvec)
     endif()
 endif()
+
+#
+# Simple C99 API example - no RHI dependency, always available
+#
+add_subdirectory(simple-c99-api)

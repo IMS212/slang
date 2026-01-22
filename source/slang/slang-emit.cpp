@@ -1367,17 +1367,8 @@ Result linkAndOptimizeIR(
         //
         SLANG_PASS(legalizeResourceTypes, targetProgram, sink);
 
-        // Lower global resources to bindless descriptor handles if configured.
-        // This runs after legalizeResourceTypes so that resources hoisted from
-        // structs (e.g., "materialTextures_diffuse" from MaterialTextures.diffuse)
-        // are available as individual global params that can be matched.
-        if (targetProgram->m_bindlessResourceIndexMap.getCount() > 0)
-        {
-            SLANG_PASS(lowerBindlessResources, targetProgram, sink, &bindlessConvertedResources);
-            // The bindless pass creates GetDynamicResourceHeap instructions at module scope
-            // which need to be lowered to actual resource heap global params.
-            SLANG_PASS(lowerDynamicResourceHeap, targetProgram, sink);
-        }
+        // Note: Bindless resource lowering is done after DCE (see below) to ensure
+        // only actually-used resources are converted.
 
         // We also need to legalize empty types for Metal targets.
         switch (target)
@@ -1429,8 +1420,19 @@ Result linkAndOptimizeIR(
     else
         SLANG_PASS(simplifyIR, targetProgram, fastIRSimplificationOptions, sink);
 
-    if (requiredLoweringPassSet.dynamicResourceHeap)
+    // Lower global resources to bindless descriptor handles if configured.
+    // This runs after legalizeResourceTypes (so struct members are hoisted)
+    // and after DCE (so only actually-used resources are converted).
+    if (targetProgram->m_bindlessResourceIndexMap.getCount() > 0 || targetProgram->m_bindlessResolver)
+    {
+        SLANG_PASS(lowerBindlessResources, targetProgram, sink, &bindlessConvertedResources);
+        // Bindless lowering creates GetDynamicResourceHeap instructions that need lowering
         SLANG_PASS(lowerDynamicResourceHeap, targetProgram, sink);
+    }
+    else if (requiredLoweringPassSet.dynamicResourceHeap)
+    {
+        SLANG_PASS(lowerDynamicResourceHeap, targetProgram, sink);
+    }
 
     validateIRModuleIfEnabled(codeGenContext, irModule);
 
@@ -2064,6 +2066,7 @@ Result linkAndOptimizeIR(
         info.name = metadata->m_bindlessAllocator.allocate(res.name.getUnownedSlice());
         info.typeName = metadata->m_bindlessAllocator.allocate(res.typeName.getUnownedSlice());
         info.index = res.index;
+        info.access = res.access;
         metadata->m_bindlessConvertedResources.add(info);
     }
 

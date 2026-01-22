@@ -10,6 +10,7 @@
 #include "../core/slang-smart-pointer.h"
 #include "slang-hlsl-to-vulkan-layout-options.h"
 #include "slang-ir.h"
+#include "slang-ir-lower-bindless-resources.h"
 #include "slang-linkable.h"
 #include "slang-target.h"
 
@@ -122,9 +123,30 @@ public:
     /// Get the bindless resource index map.
     Dictionary<String, int>& getBindlessResourceIndexMap() { return m_bindlessResourceIndexMap; }
 
+    /// Set the bindless resolver callback for dynamic index resolution.
+    /// The callback is invoked during IR lowering (after DCE) for each used resource.
+    void setBindlessResolver(
+        BindlessResolverCallback callback,
+        void* userData,
+        Dictionary<String, int>* cache)
+    {
+        m_bindlessResolver = callback;
+        m_bindlessResolverUserData = userData;
+        m_bindlessResolverCache = cache;
+    }
+
     /// Map of resource names to bindless indices for conversion.
     /// This is public so IR passes can access it directly.
     Dictionary<String, int> m_bindlessResourceIndexMap;
+
+    /// Bindless resolver callback for dynamic index resolution.
+    /// Called during IR lowering for each resource that needs a bindless index.
+    BindlessResolverCallback m_bindlessResolver = nullptr;
+    void* m_bindlessResolverUserData = nullptr;
+
+    /// Pointer to external cache (owned by caller, e.g., C99 compiler).
+    /// Key format is "resourceName:resourceType" where resourceType is the enum value.
+    Dictionary<String, int>* m_bindlessResolverCache = nullptr;
 
 private:
     RefPtr<IRModule> createIRModuleForLayout(DiagnosticSink* sink);

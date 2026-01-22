@@ -22,7 +22,7 @@ struct BindlessResourceLoweringContext
 
     // Resource heap arrays for each (bindingIndex, elementType) pair
     // We use a combined key: bindingIndex * 65536 + type pointer hash
-    Dictionary<uint64_t, IRInst*> resourceHeaps;
+    Dictionary<uint64_t, IRGlobalParam*> resourceHeaps;
 
     uint64_t makeResourceHeapKey(int bindingIndex, IRType* elementType)
     {
@@ -30,24 +30,81 @@ struct BindlessResourceLoweringContext
         return ((uint64_t)bindingIndex << 48) | ((uint64_t)(uintptr_t)elementType & 0xFFFFFFFFFFFF);
     }
 
+    // Create a var layout for a resource heap with specific set/binding
+    IRVarLayout* createResourceHeapLayout(IRBuilder& builder, UInt spaceIndex, UInt bindingIndex)
+    {
+        IRTypeLayout::Builder typeLayoutBuilder(&builder);
+        typeLayoutBuilder.addResourceUsage(
+            LayoutResourceKind::DescriptorTableSlot,
+            LayoutSize::infinite());
+        auto typeLayout = typeLayoutBuilder.build();
+        IRVarLayout::Builder varLayoutBuilder(&builder, typeLayout);
+        varLayoutBuilder.findOrAddResourceInfo(LayoutResourceKind::RegisterSpace)->offset = spaceIndex;
+        varLayoutBuilder.findOrAddResourceInfo(LayoutResourceKind::DescriptorTableSlot)->offset = bindingIndex;
+        return varLayoutBuilder.build();
+    }
+
+    AddressSpace getResourceHeapAddressSpace(IRType* elementType)
+    {
+        switch (elementType->getOp())
+        {
+        case kIROp_SamplerStateType:
+        case kIROp_SamplerComparisonStateType:
+        case kIROp_TextureType:
+            return AddressSpace::UniformConstant;
+
+        case kIROp_ConstantBufferType:
+        case kIROp_ParameterBlockType:
+            return AddressSpace::Uniform;
+
+        case kIROp_HLSLStructuredBufferType:
+        case kIROp_HLSLRWStructuredBufferType:
+        case kIROp_HLSLByteAddressBufferType:
+        case kIROp_HLSLRWByteAddressBufferType:
+        case kIROp_HLSLAppendStructuredBufferType:
+        case kIROp_HLSLConsumeStructuredBufferType:
+        case kIROp_HLSLRasterizerOrderedStructuredBufferType:
+        case kIROp_HLSLRasterizerOrderedByteAddressBufferType:
+            return AddressSpace::StorageBuffer;
+
+        default:
+            return AddressSpace::StorageBuffer;
+        }
+    }
+
     // Get or create a resource heap for a given binding index and element type
-    IRInst* getOrCreateResourceHeap(int bindingIndex, IRType* elementType)
+    // Creates a real GlobalParam (OpVariable in SPIR-V), not an intrinsic
+    IRGlobalParam* getOrCreateResourceHeap(int bindingIndex, IRType* elementType)
     {
         auto key = makeResourceHeapKey(bindingIndex, elementType);
         if (auto* existing = resourceHeaps.tryGetValue(key))
             return *existing;
 
-        // Create at module scope
+        // Create a GlobalParam at module scope - this becomes OpVariable in SPIR-V
         IRBuilder moduleBuilder(module);
         moduleBuilder.setInsertInto(module->getModuleInst());
 
         auto unboundedArrayType = moduleBuilder.getUnsizedArrayType(elementType);
-        auto bindingIndexLit = moduleBuilder.getIntValue(moduleBuilder.getBasicType(BaseType::UInt), bindingIndex);
-        auto resourceHeap = moduleBuilder.emitIntrinsicInst(
+        auto heapPtrType = moduleBuilder.getPtrType(
             unboundedArrayType,
-            kIROp_GetDynamicResourceHeap,
-            1,
-            &bindingIndexLit);
+            AccessQualifier::ReadWrite,
+            getResourceHeapAddressSpace(elementType));
+
+        // Create a real global parameter (becomes OpVariable in SPIR-V)
+        auto resourceHeap = moduleBuilder.createGlobalParam(heapPtrType);
+
+        // Add layout decoration with set 0 (bindless descriptor set) and the binding index
+        // The space index comes from the target program's bindless configuration
+        UInt spaceIndex = 0;
+        if (targetProgram)
+        {
+            spaceIndex = targetProgram->getOptionSet().getIntOption(
+                CompilerOptionName::BindlessSpaceIndex);
+        }
+        auto varLayout = createResourceHeapLayout(moduleBuilder, spaceIndex, (UInt)bindingIndex);
+        moduleBuilder.addLayoutDecoration(resourceHeap, varLayout);
+        moduleBuilder.addNameHintDecoration(resourceHeap, toSlice("__slang_resource_heap"));
+        moduleBuilder.addRequireSPIRVDescriptorIndexingExtensionDecoration(resourceHeap);
 
         resourceHeaps[key] = resourceHeap;
         return resourceHeap;
@@ -90,8 +147,95 @@ struct BindlessResourceLoweringContext
         return name;
     }
 
+    // Map IR type to BindlessResourceType enum for the resolver callback
+    BindlessResourceType getBindlessResourceTypeForIRType(IRType* type)
+    {
+        switch (type->getOp())
+        {
+        case kIROp_SamplerStateType:
+        case kIROp_SamplerComparisonStateType:
+            return BindlessResourceType::Sampler;
+
+        case kIROp_TextureType:
+        {
+            auto textureType = as<IRTextureType>(type);
+            if (textureType && textureType->isCombined())
+                return BindlessResourceType::CombinedTextureSampler;
+            if (textureType && textureType->getAccess() == SLANG_RESOURCE_ACCESS_READ_WRITE)
+                return BindlessResourceType::StorageImage;
+            return BindlessResourceType::SampledImage;
+        }
+
+        case kIROp_ConstantBufferType:
+        case kIROp_ParameterBlockType:
+            return BindlessResourceType::UniformBuffer;
+
+        case kIROp_HLSLStructuredBufferType:
+        case kIROp_HLSLRWStructuredBufferType:
+        case kIROp_HLSLByteAddressBufferType:
+        case kIROp_HLSLRWByteAddressBufferType:
+        case kIROp_HLSLAppendStructuredBufferType:
+        case kIROp_HLSLConsumeStructuredBufferType:
+        case kIROp_HLSLRasterizerOrderedStructuredBufferType:
+        case kIROp_HLSLRasterizerOrderedByteAddressBufferType:
+            return BindlessResourceType::StorageBuffer;
+
+        default:
+            return BindlessResourceType::StorageBuffer;
+        }
+    }
+
+    // Determine the access mode for a resource type
+    ::SlangResourceAccess getResourceAccess(IRType* type)
+    {
+        switch (type->getOp())
+        {
+        // Read-write buffer types
+        case kIROp_HLSLRWStructuredBufferType:
+        case kIROp_HLSLRWByteAddressBufferType:
+            return SLANG_RESOURCE_ACCESS_READ_WRITE;
+
+        // Rasterizer ordered types
+        case kIROp_HLSLRasterizerOrderedStructuredBufferType:
+        case kIROp_HLSLRasterizerOrderedByteAddressBufferType:
+            return SLANG_RESOURCE_ACCESS_RASTER_ORDERED;
+
+        // Append/consume types
+        case kIROp_HLSLAppendStructuredBufferType:
+            return SLANG_RESOURCE_ACCESS_APPEND;
+        case kIROp_HLSLConsumeStructuredBufferType:
+            return SLANG_RESOURCE_ACCESS_CONSUME;
+
+        // Textures need access check
+        case kIROp_TextureType:
+        {
+            auto textureType = as<IRTextureType>(type);
+            if (textureType)
+                return textureType->getAccess();
+            return SLANG_RESOURCE_ACCESS_READ;
+        }
+
+        // Read-only types (StructuredBuffer, ByteAddressBuffer, ConstantBuffer, samplers, etc.)
+        default:
+            return SLANG_RESOURCE_ACCESS_READ;
+        }
+    }
+
+    // Make a cache key from resource name and type
+    String makeCacheKey(const String& name, BindlessResourceType resourceType)
+    {
+        StringBuilder sb;
+        sb << name << ":" << (int)resourceType;
+        return sb.produceString();
+    }
+
     // Get the binding index for a resource type (VkMutable bindings)
-    // Sampler = 0, CombinedTextureSampler = 1, everything else = 2
+    // Binding 0: Samplers
+    // Binding 1: Combined Texture Samplers
+    // Binding 2: Textures (read-only, SampledImage)
+    // Binding 3: RWTextures (read-write, StorageImage)
+    // Binding 4: UBOs (ConstantBuffer)
+    // Binding 5: SSBOs (StructuredBuffer, ByteAddressBuffer, etc.)
     int getBindingIndexForResourceType(IRType* type)
     {
         switch (type->getOp())
@@ -99,27 +243,88 @@ struct BindlessResourceLoweringContext
         case kIROp_SamplerStateType:
         case kIROp_SamplerComparisonStateType:
             return 0; // Sampler binding
+
         case kIROp_TextureType:
         {
             // Check if this is a combined texture sampler
             auto textureType = as<IRTextureType>(type);
             if (textureType && textureType->isCombined())
                 return 1; // CombinedTextureSampler binding
-            return 2; // SampledImage/StorageImage binding
+            // Check access mode for read-only vs read-write
+            if (textureType && textureType->getAccess() == SLANG_RESOURCE_ACCESS_READ_WRITE)
+                return 3; // RWTexture (StorageImage) binding
+            return 2; // Texture (SampledImage) binding
         }
+
+        case kIROp_ConstantBufferType:
+        case kIROp_ParameterBlockType:
+            return 4; // UBO binding
+
+        case kIROp_HLSLStructuredBufferType:
+        case kIROp_HLSLRWStructuredBufferType:
+        case kIROp_HLSLByteAddressBufferType:
+        case kIROp_HLSLRWByteAddressBufferType:
+        case kIROp_HLSLAppendStructuredBufferType:
+        case kIROp_HLSLConsumeStructuredBufferType:
+        case kIROp_HLSLRasterizerOrderedStructuredBufferType:
+        case kIROp_HLSLRasterizerOrderedByteAddressBufferType:
+            return 5; // SSBO binding
+
         default:
-            return 2; // Buffer types and others
+            return 5; // Other buffer types default to SSBO
         }
+    }
+
+    // Resolve a bindless index for a resource, using cache and callback if available
+    int resolveBindlessIndex(const String& name, IRType* resourceType)
+    {
+        auto& indexMap = targetProgram->m_bindlessResourceIndexMap;
+        auto resolver = targetProgram->m_bindlessResolver;
+        auto cache = targetProgram->m_bindlessResolverCache;
+        auto userData = targetProgram->m_bindlessResolverUserData;
+
+        // 1. First check static index map (exact or suffix match)
+        int staticIndex = findIndexForName(name, indexMap);
+        if (staticIndex >= 0)
+            return staticIndex;
+
+        // 2. If no resolver callback, resource is not mapped
+        if (!resolver)
+            return -1;
+
+        // 3. Get the resource type for the callback
+        BindlessResourceType bindlessType = getBindlessResourceTypeForIRType(resourceType);
+
+        // 4. Check the cache
+        String cacheKey = makeCacheKey(name, bindlessType);
+        if (cache)
+        {
+            if (auto* cachedIndex = cache->tryGetValue(cacheKey))
+                return *cachedIndex;
+        }
+
+        // 5. Call the resolver callback (convert enum class to C enum for public API)
+        slang::SlangBindlessResourceType publicType = static_cast<slang::SlangBindlessResourceType>(bindlessType);
+        int resolvedIndex = resolver(name.getBuffer(), publicType, userData);
+
+        // 6. Cache the result (even if -1, to avoid repeated calls)
+        if (cache && resolvedIndex >= 0)
+        {
+            cache->add(cacheKey, resolvedIndex);
+        }
+
+        return resolvedIndex;
     }
 
     void processModule()
     {
-        // 1. Get the name-to-index map from TargetProgram
+        // Check if we have any bindless configuration
         auto& indexMap = targetProgram->m_bindlessResourceIndexMap;
-        if (indexMap.getCount() == 0)
+        auto resolver = targetProgram->m_bindlessResolver;
+        if (indexMap.getCount() == 0 && !resolver)
             return; // Nothing to do
 
-        // 2. Find global resources to convert
+        // Find global resources to convert (after DCE, so only used resources remain)
         List<IRGlobalParam*> resourcesToConvert;
         List<IRGlobalParam*> unmappedResources;
 
@@ -134,7 +339,7 @@ struct BindlessResourceLoweringContext
             if (!isResourceType(paramType))
                 continue;
 
-            // Check if it has uses (actively used)
+            // Check if it has uses (actively used after DCE)
             if (!globalParam->hasUses())
                 continue;
 
@@ -145,8 +350,9 @@ struct BindlessResourceLoweringContext
 
             String name = nameHint->getName();
 
-            // Check if name is in map (supports both exact match and suffix match for hoisted members)
-            if (findIndexForName(name, indexMap) >= 0)
+            // Try to resolve an index for this resource
+            int index = resolveBindlessIndex(name, paramType);
+            if (index >= 0)
             {
                 resourcesToConvert.add(globalParam);
             }
@@ -156,7 +362,7 @@ struct BindlessResourceLoweringContext
             }
         }
 
-        // 3. Emit warnings for unmapped resources
+        // Emit warnings for unmapped resources (only if we have any bindless config)
         for (auto param : unmappedResources)
         {
             auto nameHint = param->findDecoration<IRNameHintDecoration>();
@@ -169,17 +375,17 @@ struct BindlessResourceLoweringContext
             }
         }
 
-        // 4. If no resources to convert, we're done
+        // If no resources to convert, we're done
         if (resourcesToConvert.getCount() == 0)
             return;
 
-        // 5. Create the index buffer SSBO at set 1, binding 3
+        // Create the index buffer SSBO at set 1, binding 3
         createIndexBuffer();
 
-        // 6. Convert each resource
+        // Convert each resource
         for (auto globalParam : resourcesToConvert)
         {
-            convertResource(globalParam, indexMap);
+            convertResourceWithResolver(globalParam);
         }
     }
 
@@ -188,11 +394,9 @@ struct BindlessResourceLoweringContext
         IRBuilder builder(module);
         builder.setInsertInto(module->getModuleInst());
 
-        // Type: StructuredBuffer<uint2>
-        // uint2 is used because DescriptorHandle is typically 64 bits (2x32-bit)
+        // Type: StructuredBuffer<uint>
         auto uintType = builder.getBasicType(BaseType::UInt);
-        auto uint2Type = builder.getVectorType(uintType, 2);
-        auto structuredBufferType = builder.getType(kIROp_HLSLStructuredBufferType, uint2Type);
+        auto structuredBufferType = builder.getType(kIROp_HLSLStructuredBufferType, uintType);
 
         indexBuffer = builder.createGlobalParam(structuredBufferType);
         builder.addNameHintDecoration(indexBuffer, toSlice("__slang_bindless_indices"));
@@ -209,20 +413,21 @@ struct BindlessResourceLoweringContext
         typeLayoutBuilder.addResourceUsage(LayoutResourceKind::DescriptorTableSlot, LayoutSize(1));
         auto typeLayout = typeLayoutBuilder.build();
 
-        // Create var layout with set 1, binding 3
+        // Create var layout with set 0, binding 6
         IRVarLayout::Builder varLayoutBuilder(&builder, typeLayout);
-        varLayoutBuilder.findOrAddResourceInfo(LayoutResourceKind::RegisterSpace)->offset = 1;
-        varLayoutBuilder.findOrAddResourceInfo(LayoutResourceKind::DescriptorTableSlot)->offset = 3;
+        varLayoutBuilder.findOrAddResourceInfo(LayoutResourceKind::RegisterSpace)->offset = 0;
+        varLayoutBuilder.findOrAddResourceInfo(LayoutResourceKind::DescriptorTableSlot)->offset = 6;
         return varLayoutBuilder.build();
     }
 
-    void convertResource(IRGlobalParam* param, const Dictionary<String, int>& indexMap)
+    void convertResourceWithResolver(IRGlobalParam* param)
     {
         auto nameHint = param->findDecoration<IRNameHintDecoration>();
         String name = nameHint->getName();
-        int index = findIndexForName(name, indexMap);
-
         auto resourceType = param->getDataType();
+
+        // Resolve the index (will use cache if already resolved)
+        int index = resolveBindlessIndex(name, resourceType);
 
         IRBuilder builder(module);
 
@@ -271,9 +476,9 @@ struct BindlessResourceLoweringContext
 
             // 1. Load index buffer element: indexBuffer[STATIC_INDEX]
             auto indexLiteral = builder.getIntValue(builder.getBasicType(BaseType::Int), index);
-            auto uint2Type = builder.getVectorType(builder.getBasicType(BaseType::UInt), 2);
+            auto uintType = builder.getBasicType(BaseType::UInt);
             IRInst* loadArgs[] = { indexBuffer, indexLiteral };
-            auto uint2Value = builder.emitIntrinsicInst(uint2Type, kIROp_StructuredBufferLoad, 2, loadArgs);
+            auto heapIndex = builder.emitIntrinsicInst(uintType, kIROp_StructuredBufferLoad, 2, loadArgs);
 
             // Get binding index based on resource type (VkMutable bindings)
             int bindingIndex = getBindingIndexForResourceType(resourceType);
@@ -281,29 +486,25 @@ struct BindlessResourceLoweringContext
             // Get or create the resource heap at module scope
             auto resourceHeap = getOrCreateResourceHeap(bindingIndex, resourceType);
 
-            // Extract the index from uint2 (use .x component)
-            auto uintType = builder.getBasicType(BaseType::UInt);
-            uint32_t swizzleIndex = 0; // .x component
-            auto heapIndex = builder.emitSwizzle(uintType, uint2Value, 1, &swizzleIndex);
-
             // For SPIRV, unbounded arrays need pointer-based access:
             // 1. Get a pointer to the element (OpAccessChain)
             // 2. Load from that pointer
-            auto ptrType = builder.getPtrType(resourceType);
-            auto elementPtr = builder.emitElementAddress(ptrType, resourceHeap, heapIndex);
+            auto elementPtr = builder.emitElementAddress(resourceHeap, heapIndex);
             auto dereferencedResource = builder.emitLoad(resourceType, elementPtr);
 
             // Replace this use with the dereferenced resource
             builder.replaceOperand(use, dereferencedResource);
         }
 
-        // Record for metadata output (use the matched key name, not the hoisted name)
+        // Record for metadata output
         if (outConvertedResources)
         {
             BindlessConvertedResource info;
-            info.name = findMatchingKeyName(name, indexMap);
+            info.name = name;
             info.typeName = getResourceTypeName(resourceType);
             info.index = index;
+            info.resourceType = getBindlessResourceTypeForIRType(resourceType);
+            info.access = getResourceAccess(resourceType);
             outConvertedResources->add(info);
         }
 

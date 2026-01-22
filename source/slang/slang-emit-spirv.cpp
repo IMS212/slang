@@ -3301,7 +3301,8 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             }
         }
         auto storageClass = SpvStorageClassUniform;
-        if (auto ptrType = as<IRPtrTypeBase>(param->getDataType()))
+        IRType* varType = param->getDataType();
+        if (auto ptrType = as<IRPtrTypeBase>(varType))
         {
             if (ptrType->hasAddressSpace())
                 storageClass = addressSpaceToStorageClass(ptrType->getAddressSpace());
@@ -3313,10 +3314,42 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             return systemValInst;
         }
 
+        // For SPIR-V, OpVariable result type must be a pointer type.
+        // If the param's type is not already a pointer, wrap it.
+        if (!as<IRPtrTypeBase>(varType))
+        {
+            IRBuilder builder(m_irModule);
+            // Map SPIR-V storage class to Slang AddressSpace
+            AddressSpace addrSpace = AddressSpace::Uniform;
+            switch (storageClass)
+            {
+            case SpvStorageClassUniform:
+                addrSpace = AddressSpace::Uniform;
+                break;
+            case SpvStorageClassStorageBuffer:
+                addrSpace = AddressSpace::StorageBuffer;
+                break;
+            case SpvStorageClassInput:
+                addrSpace = AddressSpace::Input;
+                break;
+            case SpvStorageClassOutput:
+                addrSpace = AddressSpace::Output;
+                break;
+            default:
+                addrSpace = AddressSpace::Uniform;
+                break;
+            }
+            varType = builder.getPtrType(
+                kIROp_PtrType,
+                varType,
+                AccessQualifier::ReadWrite,
+                addrSpace);
+        }
+
         auto varInst = emitOpVariable(
             getSection(SpvLogicalSectionID::GlobalVariables),
             param,
-            param->getDataType(),
+            varType,
             storageClass);
         maybeEmitPointerDecoration(varInst, param);
         maybeEmitWriteOnlyImageDecoration(varInst, param);
@@ -7177,6 +7210,15 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 cast<IRPtrTypeBase>(inst->getDataType()),
                 basePtrType->getAddressSpace());
         }
+        else if (as<IRArrayTypeBase>(base->getDataType()))
+        {
+            // For GlobalParams with array types (e.g., bindless resource heaps),
+            // the SPIR-V variable is in Uniform storage class.
+            // We need to ensure the result pointer has matching storage class.
+            resultType = getPtrTypeWithAddressSpace(
+                cast<IRPtrTypeBase>(inst->getDataType()),
+                AddressSpace::Uniform);
+        }
         else
         {
             SLANG_ASSERT(
@@ -7186,7 +7228,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         return emitOpAccessChain(
             parent,
             inst,
-            inst->getFullType(),
+            resultType,
             baseId,
             makeArray(inst->getIndex()));
     }

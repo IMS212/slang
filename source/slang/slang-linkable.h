@@ -195,6 +195,11 @@ public:
         const SlangInt* indices,
         SlangInt count) SLANG_OVERRIDE;
 
+    SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessResolver(
+        SlangInt targetIndex,
+        slang::SlangBindlessResolverCallback callback,
+        void* userData) SLANG_OVERRIDE;
+
     //
     // slang::IModulePrecompileService interface
     //

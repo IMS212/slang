@@ -4696,6 +4696,31 @@ struct IComponentType2 : public ISlangUnknown
 };
     #define SLANG_UUID_IComponentType2 IComponentType2::getTypeGuid()
 
+/** Bindless resource type for resolver callback.
+These correspond to different descriptor heap bindings (0-5).
+*/
+enum SlangBindlessResourceType
+{
+    SLANG_BINDLESS_RESOURCE_TYPE_SAMPLER = 0,
+    SLANG_BINDLESS_RESOURCE_TYPE_COMBINED_TEXTURE_SAMPLER = 1,
+    SLANG_BINDLESS_RESOURCE_TYPE_SAMPLED_IMAGE = 2,      // Texture (read-only)
+    SLANG_BINDLESS_RESOURCE_TYPE_STORAGE_IMAGE = 3,      // RWTexture (read-write)
+    SLANG_BINDLESS_RESOURCE_TYPE_UNIFORM_BUFFER = 4,     // ConstantBuffer
+    SLANG_BINDLESS_RESOURCE_TYPE_STORAGE_BUFFER = 5,     // StructuredBuffer, ByteAddressBuffer, etc.
+};
+
+/** Callback type for resolving bindless resource indices.
+Called during IR lowering (after DCE) for each actually-used resource.
+@param resourceName The name of the resource
+@param resourceType The type category (determines which heap binding)
+@param userData User-provided context pointer
+@return Index buffer slot for this resource, or -1 to skip (not bindless)
+*/
+typedef int (*SlangBindlessResolverCallback)(
+    const char* resourceName,
+    SlangBindlessResourceType resourceType,
+    void* userData);
+
 /** IComponentType3 provides support for bindless resource lowering.
 
 This interface allows setting a map from resource names to bindless index buffer indices.
@@ -4713,7 +4738,7 @@ struct IComponentType3 : public ISlangUnknown
         {0xb6, 0x43, 0x9e, 0x72, 0x1c, 0xa8, 0x5d, 0x2b})
 
     /** Set the bindless resource index map for a specific target.
-    
+
     @param targetIndex The target index to configure
     @param names Array of resource names
     @param indices Array of index values corresponding to each name
@@ -4725,6 +4750,20 @@ struct IComponentType3 : public ISlangUnknown
         const char* const* names,
         const SlangInt* indices,
         SlangInt count) = 0;
+
+    /** Set a bindless resolver callback for dynamic index resolution.
+    The callback is invoked during IR lowering (after DCE) for each used resource.
+    Results are cached using the provided cache key-value store.
+
+    @param targetIndex The target index to configure
+    @param callback The resolver callback function
+    @param userData User data passed to the callback
+    @return SLANG_OK on success
+    */
+    virtual SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessResolver(
+        SlangInt targetIndex,
+        SlangBindlessResolverCallback callback,
+        void* userData) = 0;
 };
     #define SLANG_UUID_IComponentType3 IComponentType3::getTypeGuid()
 

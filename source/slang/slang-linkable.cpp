@@ -8,6 +8,7 @@
 #include "core/slang-memory-file-system.h"
 #include "slang-check-impl.h"
 #include "slang-compiler.h"
+#include "slang-ir-lower-bindless-resources.h"
 #include "slang-lookup.h"
 #include "slang-mangle.h"
 
@@ -560,17 +561,35 @@ SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::setBindlessResourceIndexMa
     auto linkage = getLinkage();
     if (targetIndex < 0 || targetIndex >= linkage->targets.getCount())
         return SLANG_E_INVALID_ARG;
-    
+
     auto target = linkage->targets[targetIndex];
     auto targetProgram = getTargetProgram(target);
-    
+
     Dictionary<String, int> map;
     for (SlangInt i = 0; i < count; i++)
     {
         map.set(String(names[i]), (int)indices[i]);
     }
     targetProgram->setBindlessResourceIndexMap(map);
-    
+
+    return SLANG_OK;
+}
+
+SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::setBindlessResolver(
+    Int targetIndex,
+    slang::SlangBindlessResolverCallback callback,
+    void* userData)
+{
+    auto linkage = getLinkage();
+    if (targetIndex < 0 || targetIndex >= linkage->targets.getCount())
+        return SLANG_E_INVALID_ARG;
+
+    auto target = linkage->targets[targetIndex];
+    auto targetProgram = getTargetProgram(target);
+
+    // BindlessResolverCallback is a typedef for SlangBindlessResolverCallback
+    targetProgram->setBindlessResolver(callback, userData, nullptr);
+
     return SLANG_OK;
 }
 

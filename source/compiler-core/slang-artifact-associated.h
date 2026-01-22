@@ -127,9 +127,10 @@ struct ShaderBindingRange;
 /// Information about a resource that was converted to bindless access.
 struct BindlessResourceInfo
 {
-    TerminatedCharSlice name;     ///< Original resource name
-    TerminatedCharSlice typeName; ///< Type of the resource (e.g., "Texture2D", "RWStructuredBuffer")
-    SlangInt index;               ///< Index in the bindless index buffer
+    TerminatedCharSlice name;       ///< Original resource name
+    TerminatedCharSlice typeName;   ///< Type of the resource (e.g., "Texture2D", "RWStructuredBuffer")
+    SlangInt index;                 ///< Index in the bindless index buffer
+    SlangResourceAccess access;     ///< Access mode (uses existing SlangResourceAccess enum from slang.h)
 };
 
 class IArtifactPostEmitMetadata : public slang::IMetadata
