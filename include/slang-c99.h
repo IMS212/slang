@@ -38,6 +38,7 @@ typedef void* SlangcCompiler;      /* Compiler context / session */
 typedef void* SlangcModule;        /* Loaded module (reusable across programs) */
 typedef void* SlangcProgram;       /* Program being built (modules + entry points) */
 typedef void* SlangcBlob;          /* Binary data (SPIR-V, etc.) */
+typedef void* SlangcType;          /* Type handle for specialization */
 
 /*
  * Target format for code generation
@@ -300,6 +301,40 @@ SLANGC_API const char* slangc_getEntryPointName(SlangcProgram program, int index
 
 /* Get entry point stage by index */
 SLANGC_API SlangcStage slangc_getEntryPointStage(SlangcProgram program, int index);
+
+/*
+ * Generic Specialization
+ *
+ * These functions allow compiling shaders with generic entry points
+ * by providing concrete type arguments.
+ */
+
+/* Get the number of specialization parameters required by the program.
+ * Call this after adding modules and entry points but before link.
+ * Returns 0 if the program has no generic parameters.
+ */
+SLANGC_API int slangc_getSpecializationParamCount(SlangcProgram program);
+
+/* Find a type by name in a module. Returns NULL if not found.
+ * The returned type handle is valid until the module is destroyed.
+ */
+SLANGC_API SlangcType slangc_findTypeByName(SlangcModule module, const char* typeName);
+
+/* Add a specialization argument using a type expression string.
+ * Call once for each specialization parameter before calling slangc_link.
+ * Example: slangc_addSpecializationArgExpr(program, "Grayscale");
+ */
+SLANGC_API void slangc_addSpecializationArgExpr(SlangcProgram program, const char* typeExpr);
+
+/* Add a specialization argument using a type handle from slangc_findTypeByName.
+ * Call once for each specialization parameter before calling slangc_link.
+ */
+SLANGC_API void slangc_addSpecializationArgType(SlangcProgram program, SlangcType type);
+
+/* Clear all specialization arguments to reuse the program with different types.
+ * This allows re-linking the same program with different specializations.
+ */
+SLANGC_API void slangc_clearSpecializationArgs(SlangcProgram program);
 
 #ifdef __cplusplus
 }

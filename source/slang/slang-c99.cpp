@@ -105,6 +105,15 @@ struct SlangcProgramImpl
     std::vector<EntryPointInfo> entryPoints;
     std::unordered_map<std::string, int> bindlessIndices;
 
+    // Specialization state (pre-link)
+    std::vector<std::string> specializationExprs;
+    std::vector<slang::TypeReflection*> specializationTypes;
+    std::vector<bool> specializationIsType;
+
+    // Cached composed program for param count query
+    ComPtr<slang::IComponentType> composedProgram;
+    bool needsRecompose = true;
+
     // Wrapper for passing resolver to internal API (created during link from compiler's resolver)
     std::unique_ptr<BindlessResolverWrapper> resolverWrapper;
 
@@ -408,6 +417,64 @@ static SlangStage toSlangStage(SlangcStage stage)
 }
 
 //
+// Helper function for lazy composition
+//
+
+static bool ensureComposedProgram(SlangcProgramImpl* impl)
+{
+    if (!impl->needsRecompose && impl->composedProgram)
+        return true;
+
+    if (!impl->compiler || !impl->compiler->session)
+        return false;
+
+    if (impl->entryPoints.empty())
+        return false;
+
+    // Build component list: modules + entry points
+    std::vector<slang::IComponentType*> components;
+
+    // Add all modules
+    for (auto mod : impl->modules)
+        components.push_back(mod);
+
+    // Find and add entry points
+    ComPtr<slang::IBlob> diagnostics;
+    std::vector<ComPtr<slang::IEntryPoint>> entryPointRefs;  // Keep refs alive
+    for (auto& epInfo : impl->entryPoints)
+    {
+        ComPtr<slang::IEntryPoint> entryPoint;
+        if (SLANG_FAILED(epInfo.module->findAndCheckEntryPoint(
+            epInfo.name.c_str(),
+            toSlangStage(epInfo.stage),
+            entryPoint.writeRef(),
+            diagnostics.writeRef())))
+        {
+            impl->appendDiagnostics(diagnostics);
+            return false;
+        }
+        impl->appendDiagnostics(diagnostics);
+        entryPointRefs.push_back(entryPoint);
+        components.push_back(entryPoint.get());
+    }
+
+    // Create composite component
+    if (SLANG_FAILED(impl->compiler->session->createCompositeComponentType(
+        components.data(),
+        (SlangInt)components.size(),
+        impl->composedProgram.writeRef(),
+        diagnostics.writeRef())))
+    {
+        impl->appendDiagnostics(diagnostics);
+        return false;
+    }
+    impl->appendDiagnostics(diagnostics);
+
+    impl->needsRecompose = false;
+    return true;
+}
+
+//
 // C API Implementation
 //
 
@@ -641,8 +708,9 @@ SLANGC_API int slangc_link(SlangcProgram program)
     for (auto mod : impl->modules)
         components.push_back(mod);
 
-    // Find and add entry points
+    // Find and add entry points (keep refs alive during compose/specialize/link)
     ComPtr<slang::IBlob> diagnostics;
+    std::vector<ComPtr<slang::IEntryPoint>> entryPointRefs;
     for (auto& epInfo : impl->entryPoints)
     {
         ComPtr<slang::IEntryPoint> entryPoint;
@@ -657,6 +725,7 @@ SLANGC_API int slangc_link(SlangcProgram program)
             return 0;
         }
         impl->appendDiagnostics(diagnostics);
+        entryPointRefs.push_back(entryPoint);
         components.push_back(entryPoint.get());
     }
 
@@ -674,9 +743,55 @@ SLANGC_API int slangc_link(SlangcProgram program)
     }
     impl->appendDiagnostics(diagnostics);
 
+    // Handle specialization if arguments were provided
+    ComPtr<slang::IComponentType> programToLink = composedProgram;
+
+    if (!impl->specializationExprs.empty() || !impl->specializationTypes.empty())
+    {
+        auto paramCount = composedProgram->getSpecializationParamCount();
+        size_t argCount = impl->specializationIsType.size();
+
+        if (argCount != (size_t)paramCount)
+        {
+            std::string msg = "Specialization argument count mismatch: expected " +
+                std::to_string(paramCount) + ", got " + std::to_string(argCount);
+            impl->appendError(msg.c_str());
+            return 0;
+        }
+
+        std::vector<slang::SpecializationArg> specArgs;
+        for (size_t i = 0; i < argCount; i++)
+        {
+            slang::SpecializationArg arg;
+            if (impl->specializationIsType[i])
+            {
+                arg.kind = slang::SpecializationArg::Kind::Type;
+                arg.type = impl->specializationTypes[i];
+            }
+            else
+            {
+                arg.kind = slang::SpecializationArg::Kind::Expr;
+                arg.expr = impl->specializationExprs[i].c_str();
+            }
+            specArgs.push_back(arg);
+        }
+
+        ComPtr<slang::IComponentType> specializedProgram;
+        if (SLANG_FAILED(composedProgram->specialize(
+            specArgs.data(), (SlangInt)specArgs.size(),
+            specializedProgram.writeRef(), diagnostics.writeRef())))
+        {
+            impl->appendDiagnostics(diagnostics);
+            impl->appendError("Specialization failed");
+            return 0;
+        }
+        impl->appendDiagnostics(diagnostics);
+        programToLink = specializedProgram;
+    }
+
     // Link
     ComPtr<slang::IComponentType> linkedProgram;
-    if (SLANG_FAILED(composedProgram->link(linkedProgram.writeRef(), diagnostics.writeRef())))
+    if (SLANG_FAILED(programToLink->link(linkedProgram.writeRef(), diagnostics.writeRef())))
     {
         impl->appendDiagnostics(diagnostics);
         impl->appendError("Failed to link program");
@@ -1037,6 +1152,72 @@ SLANGC_API SlangcStage slangc_getEntryPointStage(SlangcProgram program, int inde
     if (!impl || index < 0 || index >= (int)impl->entryPointStages.size())
         return SLANGC_STAGE_VERTEX;
     return impl->entryPointStages[index];
+}
+
+/*
+ * Generic Specialization
+ */
+
+SLANGC_API int slangc_getSpecializationParamCount(SlangcProgram program)
+{
+    auto impl = static_cast<SlangcProgramImpl*>(program);
+    if (!impl)
+        return 0;
+
+    // Create composed program lazily to query param count
+    if (!ensureComposedProgram(impl))
+        return 0;
+
+    return (int)impl->composedProgram->getSpecializationParamCount();
+}
+
+SLANGC_API SlangcType slangc_findTypeByName(SlangcModule module, const char* typeName)
+{
+    if (!module || !typeName)
+        return nullptr;
+
+    auto mod = static_cast<slang::IModule*>(module);
+    auto layout = mod->getLayout();
+    if (!layout)
+        return nullptr;
+
+    return layout->findTypeByName(typeName);
+}
+
+SLANGC_API void slangc_addSpecializationArgExpr(SlangcProgram program, const char* typeExpr)
+{
+    auto impl = static_cast<SlangcProgramImpl*>(program);
+    if (!impl || !typeExpr)
+        return;
+
+    impl->specializationExprs.push_back(typeExpr);
+    impl->specializationTypes.push_back(nullptr);
+    impl->specializationIsType.push_back(false);
+    impl->needsRecompose = true;  // Invalidate cached composed program
+}
+
+SLANGC_API void slangc_addSpecializationArgType(SlangcProgram program, SlangcType type)
+{
+    auto impl = static_cast<SlangcProgramImpl*>(program);
+    if (!impl || !type)
+        return;
+
+    impl->specializationExprs.push_back("");
+    impl->specializationTypes.push_back(static_cast<slang::TypeReflection*>(type));
+    impl->specializationIsType.push_back(true);
+    impl->needsRecompose = true;  // Invalidate cached composed program
+}
+
+SLANGC_API void slangc_clearSpecializationArgs(SlangcProgram program)
+{
+    auto impl = static_cast<SlangcProgramImpl*>(program);
+    if (!impl)
+        return;
+
+    impl->specializationExprs.clear();
+    impl->specializationTypes.clear();
+    impl->specializationIsType.clear();
+    impl->needsRecompose = true;  // Invalidate cached composed program
 }
 
 } // extern "C"

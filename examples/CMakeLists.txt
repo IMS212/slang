@@ -123,6 +123,7 @@ if(SLANG_ENABLE_EXAMPLES AND SLANG_ENABLE_SLANG_RHI)
     add_subdirectory(shader-object)
     add_subdirectory(shader-toy)
     add_subdirectory(triangle)
+    add_subdirectory(test-shader)
 
     #
     # Conditional examples
