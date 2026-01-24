@@ -30,18 +30,13 @@ interface Shader<O : ShaderOut>
 }
 
 [shader("vertex")]
-V.Surf vertexMain<In:VertexInput, V:Vertex, S, O:ShaderOut>(In input)
-    where V == In.Vtx
-    where S : Shader<O>
-{
+V.Surf vertexMain<In:VertexInput, V:Vertex, S, O:ShaderOut>(In input) where V == In.Vtx where S : Shader<O>{
     V v = input.toVertex();
     v = v.setPos(S.deformVertex(v));
     return v.toSurface();
 }
 
 [shader("fragment")]
-O fragmentMain<V:Vertex, S, O:ShaderOut>(V.Surf surf)
-    where S : Shader<O>
-{
+O fragmentMain<V:Vertex, S, O:ShaderOut>(V.Surf surf) where S : Shader<O> {
     return S.shadeSurface(surf);
 }

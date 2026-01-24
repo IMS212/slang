@@ -179,7 +179,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    /* Configure for SPIRV output */
+    /* Configure for GLSL output */
     slangc_setTarget(compiler, SLANGC_TARGET_GLSL);
 
     /* Load shader module */
@@ -239,9 +239,30 @@ int main(int argc, char** argv)
     SlangcBlob spirv = slangc_getCode(program);
     if (spirv)
     {
-        printf("SPIRV code size: %zu bytes\n\n", slangc_getBlobSize(spirv));
-    }
+        size_t spirvSize = slangc_getBlobSize(spirv);
+        printf("SPIRV code size: %zu bytes\n\n", spirvSize);
 
+        /* Write SPIR-V to file */
+        const char* outputPath = "D:\\slang\\examples\\test-shader\\object.spv";
+        FILE* outFile = fopen(outputPath, "wb");
+        if (outFile)
+        {
+            size_t written = fwrite(slangc_getBlobData(spirv), 1, spirvSize, outFile);
+            fclose(outFile);
+            if (written == spirvSize)
+            {
+                printf("SPIR-V written to %s\n", outputPath);
+            }
+            else
+            {
+                printf("Error: only wrote %zu of %zu bytes to %s\n", written, spirvSize, outputPath);
+            }
+        }
+        else
+        {
+            printf("Error: failed to open %s for writing\n", outputPath);
+        }
+    }
     printf((char*) slangc_getBlobData(spirv));
 
     slangc_destroyProgram(program);

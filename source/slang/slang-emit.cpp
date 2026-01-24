@@ -45,6 +45,7 @@
 #include "slang-ir-early-raytracing-intrinsic-simplification.h"
 #include "slang-ir-eliminate-multilevel-break.h"
 #include "slang-ir-eliminate-phis.h"
+#include "slang-ir-eliminate-unused-struct-fields.h"
 #include "slang-ir-entry-point-decorations.h"
 #include "slang-ir-entry-point-raw-ptr-params.h"
 #include "slang-ir-entry-point-uniforms.h"
@@ -1837,6 +1838,14 @@ Result linkAndOptimizeIR(
     SLANG_PASS(eliminateDeadCode, deadCodeEliminationOptions);
 
     SLANG_PASS(cleanUpVoidType);
+
+    // Replace unused struct field initializers with default values.
+    // This enables DCE to eliminate loads of unused varyings.
+    // For example, if a fragment shader receives a struct with (position, uvCoord)
+    // but only uses uvCoord, the position field initializer in MakeStruct
+    // gets replaced with a default value, allowing DCE to remove the position varying.
+    // Must run AFTER DCE has removed unused functions that might access fields.
+    SLANG_PASS(eliminateUnusedStructFieldInits);
 
     if (isKhronosTarget(targetRequest))
     {

@@ -3,11 +3,12 @@ import engine;
 Sampler2D mainTexture;
 
 struct RealSurface : Surface {
-    float4 position;
+    float4 position : SV_Position;
+    float4 worldPos;
     float2 uvCoord;
 
     float4 pos() {
-        return position;
+        return worldPos;
     }
 
     float2 uv() {
@@ -39,6 +40,7 @@ struct RealVertex : Vertex {
     RealSurface toSurface() {
         RealSurface s;
         s.position = position;
+        s.worldPos = position;
         s.uvCoord = uvCoord;
         return s;
     }
