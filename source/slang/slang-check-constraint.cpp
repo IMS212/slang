@@ -408,6 +408,65 @@ DeclRef<Decl> SemanticsVisitor::trySolveConstraintSystem(
         }
     }
 
+    // Try to infer unknown generic params from constraints involving known params.
+    // For example, if we have constraint `S : Shader<O>` and `S = MyShader : Shader<MyShaderOut>`,
+    // we can infer `O = MyShaderOut`.
+    //
+    for (auto constraintDecl : genericDeclRef.getDecl()->getMembersOfType<GenericTypeConstraintDecl>())
+    {
+        // Get the sub type from the constraint (e.g., S in `S : Shader<O>`)
+        auto subType = constraintDecl->sub.type;
+        auto subDeclRefType = as<DeclRefType>(subType);
+        if (!subDeclRefType)
+            continue;
+
+        // Check if sub is a known generic param
+        auto subParamDecl = as<GenericTypeParamDecl>(subDeclRefType->getDeclRef().getDecl());
+        if (!subParamDecl || subParamDecl->parameterIndex < 0)
+            continue;
+        if (subParamDecl->parameterIndex >= knownGenericArgCount)
+            continue;
+
+        // Get the known value for this param
+        auto knownSubType = as<Type>(knownGenericArgs[subParamDecl->parameterIndex]);
+        if (!knownSubType)
+            continue;
+
+        // Get the sup type (the interface, e.g., Shader<O>)
+        auto supType = constraintDecl->sup.type;
+        auto supDeclRefType = isDeclRefTypeOf<InterfaceDecl>(supType);
+        if (!supDeclRefType)
+            continue;
+
+        // Check if the interface is a generic application (e.g., Shader<O>)
+        auto supGenericApp = as<GenericAppDeclRef>(supDeclRefType.declRefBase);
+        if (!supGenericApp)
+            continue;
+
+        // Find the conformance of the known type to this interface
+        auto inheritanceInfo = getShared()->getInheritanceInfo(knownSubType);
+        for (auto facet : inheritanceInfo.facets)
+        {
+            if (facet->origin.declRef.getDecl() != supDeclRefType.getDecl())
+                continue;
+
+            // Found matching facet - extract the type args from the conformance
+            auto facetType = facet->getType();
+            auto facetDeclRefType = as<DeclRefType>(facetType);
+            if (!facetDeclRefType)
+                continue;
+
+            auto facetGenericApp = as<GenericAppDeclRef>(facetDeclRefType->getDeclRef().declRefBase);
+            if (!facetGenericApp)
+                continue;
+
+            // Unify the interface's type args with the facet's type args
+            // This should add constraints like O = MyShaderOut
+            TryUnifyTypes(*system, ValUnificationContext(), QualType(facetType), supType);
+            break;
+        }
+    }
+
     // The state of currently solved arguments.
     struct SolvedArg
     {

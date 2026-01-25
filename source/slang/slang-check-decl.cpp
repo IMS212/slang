@@ -5503,7 +5503,31 @@ bool SemanticsVisitor::trySynthesizeMethodRequirementWitness(
     // With the big picture spelled out, we can settle into
     // the work of constructing our synthesized method.
     //
-    // First, we check that the differentiabliity of the method matches the requirement,
+    // First, check that the lookup result contains at least one callable member.
+    // If the only members found are non-callable (e.g., fields), we can't
+    // synthesize a method witness from them.
+    if (lookupResult.isValid())
+    {
+        bool hasCallable = false;
+        for (auto& item : lookupResult)
+        {
+            if (as<CallableDecl>(item.declRef.getDecl()) ||
+                (as<GenericDecl>(item.declRef.getDecl()) &&
+                 as<CallableDecl>(getInner(item.declRef.as<GenericDecl>()))))
+            {
+                hasCallable = true;
+                break;
+            }
+        }
+        if (!hasCallable)
+        {
+            // The lookup found something (e.g., a field) with the same name,
+            // but no callable that could satisfy the method requirement.
+            return false;
+        }
+    }
+
+    // Next, we check that the differentiabliity of the method matches the requirement,
     // and we don't attempt to synthesize a method if they don't match.
     if (lookupResult.isValid())
     {

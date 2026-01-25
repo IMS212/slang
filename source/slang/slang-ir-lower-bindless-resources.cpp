@@ -3,6 +3,8 @@
 
 #include "slang-ir-insts.h"
 #include "slang-ir-util.h"
+#include "slang-ir-layout.h"
+#include "slang-ir-lower-buffer-element-type.h"
 #include "slang-legalize-types.h"
 #include "slang-target-program.h"
 #include "slang-diagnostics.h"
@@ -23,6 +25,15 @@ struct BindlessResourceLoweringContext
     // Resource heap arrays for each (bindingIndex, elementType) pair
     // We use a combined key: bindingIndex * 65536 + type pointer hash
     Dictionary<uint64_t, IRGlobalParam*> resourceHeaps;
+
+    // Info about lowered structured buffer wrapper types
+    struct LoweredStructuredBufferTypeInfo
+    {
+        IRStructType* wrapperStructType;
+        IRStructKey* arrayKey;
+        IRArrayTypeBase* unsizedArrayType;
+    };
+    Dictionary<IRType*, LoweredStructuredBufferTypeInfo> loweredStructuredBufferTypes;
 
     uint64_t makeResourceHeapKey(int bindingIndex, IRType* elementType)
     {
@@ -72,6 +83,24 @@ struct BindlessResourceLoweringContext
         }
     }
 
+    // Get address space from binding index (for when element type doesn't indicate it)
+    AddressSpace getAddressSpaceFromBindingIndex(int bindingIndex)
+    {
+        switch (bindingIndex)
+        {
+        case 0: // Samplers
+        case 1: // Combined Texture Samplers
+        case 2: // Textures (SampledImage)
+        case 3: // RWTextures (StorageImage)
+            return AddressSpace::UniformConstant;
+        case 4: // UBOs (uniform buffers)
+            return AddressSpace::Uniform;
+        case 5: // SSBOs (storage buffers)
+        default:
+            return AddressSpace::StorageBuffer;
+        }
+    }
+
     // Get or create a resource heap for a given binding index and element type
     // Creates a real GlobalParam (OpVariable in SPIR-V), not an intrinsic
     IRGlobalParam* getOrCreateResourceHeap(int bindingIndex, IRType* elementType)
@@ -85,10 +114,26 @@ struct BindlessResourceLoweringContext
         moduleBuilder.setInsertInto(module->getModuleInst());
 
         auto unboundedArrayType = moduleBuilder.getUnsizedArrayType(elementType);
+
+        // Determine address space: first try based on element type, fall back to binding index
+        AddressSpace addrSpace = getResourceHeapAddressSpace(elementType);
+        // If the element type didn't give us a specific address space (e.g., it's a struct),
+        // use the binding index to determine it
+        if (addrSpace == AddressSpace::StorageBuffer && !isResourceType(elementType))
+        {
+            addrSpace = getAddressSpaceFromBindingIndex(bindingIndex);
+        }
+
+        // For uniform buffer heaps (binding 4), the element type needs the SPIRV Block decoration
+        if (bindingIndex == 4 && as<IRStructType>(elementType))
+        {
+            moduleBuilder.addDecorationIfNotExist(elementType, kIROp_SPIRVBlockDecoration);
+        }
+
         auto heapPtrType = moduleBuilder.getPtrType(
             unboundedArrayType,
             AccessQualifier::ReadWrite,
-            getResourceHeapAddressSpace(elementType));
+            addrSpace);
 
         // Create a real global parameter (becomes OpVariable in SPIR-V)
         auto resourceHeap = moduleBuilder.createGlobalParam(heapPtrType);
@@ -108,6 +153,141 @@ struct BindlessResourceLoweringContext
 
         resourceHeaps[key] = resourceHeap;
         return resourceHeap;
+    }
+
+    // Create or get a wrapper struct type for StructuredBuffer<T>
+    // This mirrors what SPIRV legalization does: creates a struct containing T[]
+    LoweredStructuredBufferTypeInfo getOrCreateStructuredBufferWrapperType(IRHLSLStructuredBufferTypeBase* bufferType)
+    {
+        auto elementType = bufferType->getElementType();
+
+        // Check cache
+        if (auto* existing = loweredStructuredBufferTypes.tryGetValue(elementType))
+            return *existing;
+
+        // Create wrapper struct at module scope
+        IRBuilder moduleBuilder(module);
+        moduleBuilder.setInsertInto(module->getModuleInst());
+
+        // Get the layout rules for this buffer type to compute proper stride
+        auto layoutRules = getTypeLayoutRuleForBuffer(targetProgram, bufferType);
+
+        // For element types that are structs used in storage buffers, we need to ensure
+        // they have the correct Std430 layout. The SPIRV emitter uses the first
+        // IRSizeAndAlignmentDecoration it finds on the struct to determine layout rules.
+        // We need to remove any existing decorations with wrong layout rules so our
+        // Std430 decoration takes precedence.
+        if (auto elementStruct = as<IRStructType>(elementType))
+        {
+            // Remove ALL existing size/alignment decorations that use a different layout rule
+            // This ensures our Std430 decoration is the first one found by the emitter
+            List<IRDecoration*> decorationsToRemove;
+            for (auto decor : elementStruct->getDecorations())
+            {
+                if (auto sizeAlignDecor = as<IRSizeAndAlignmentDecoration>(decor))
+                {
+                    if (sizeAlignDecor->getLayoutName() != layoutRules->ruleName)
+                    {
+                        decorationsToRemove.add(decor);
+                    }
+                }
+            }
+            for (auto decor : decorationsToRemove)
+            {
+                decor->removeAndDeallocate();
+            }
+
+            // Also remove any existing field offset decorations with wrong layout rule
+            // The SPIRV emitter checks for these when computing member offsets
+            for (auto field : elementStruct->getFields())
+            {
+                List<IRDecoration*> fieldDecorsToRemove;
+                for (auto decor : field->getDecorations())
+                {
+                    if (auto offsetDecor = as<IROffsetDecoration>(decor))
+                    {
+                        if (offsetDecor->getLayoutName() != layoutRules->ruleName)
+                        {
+                            fieldDecorsToRemove.add(decor);
+                        }
+                    }
+                }
+                for (auto decor : fieldDecorsToRemove)
+                {
+                    decor->removeAndDeallocate();
+                }
+            }
+        }
+
+        // Compute element size and alignment for proper array stride
+        // This adds IRSizeAndAlignmentDecoration to the element type with the proper layout rules
+        IRSizeAndAlignment elementSize;
+        getSizeAndAlignment(
+            targetProgram->getTargetReq(),
+            layoutRules,
+            elementType,
+            &elementSize);
+        elementSize = layoutRules->alignCompositeElement(elementSize);
+
+        // Mark element type as physical if it's a struct (enables SPIRV member offset decorations)
+        if (auto elementStruct = as<IRStructType>(elementType))
+        {
+            moduleBuilder.addPhysicalTypeDecoration(elementStruct);
+        }
+
+        auto wrapperStruct = moduleBuilder.createStructType();
+        moduleBuilder.addPhysicalTypeDecoration(wrapperStruct);
+
+        // Create the struct key for the inner array field
+        auto arrayKey = moduleBuilder.createStructKey();
+        moduleBuilder.addNameHintDecoration(arrayKey, toSlice("_data"));
+
+        // Create unsized array of element type WITH proper stride for SPIRV
+        auto unsizedArrayType = moduleBuilder.getUnsizedArrayType(
+            elementType,
+            moduleBuilder.getIntValue(moduleBuilder.getIntType(), elementSize.getStride()));
+
+        // Add the array as a field of the wrapper struct
+        moduleBuilder.createStructField(wrapperStruct, arrayKey, unsizedArrayType);
+
+        // Compute size/alignment for the wrapper struct - this adds IRSizeAndAlignmentDecoration
+        // which is needed by SPIRV emitter for proper layout decorations
+        IRSizeAndAlignment structSize;
+        getSizeAndAlignment(targetProgram->getTargetReq(), layoutRules, wrapperStruct, &structSize);
+
+        // Add Block decoration for SPIRV
+        moduleBuilder.addDecorationIfNotExist(wrapperStruct, kIROp_SPIRVBlockDecoration);
+
+        // Add name hint based on buffer type
+        StringBuilder nameSb;
+        switch (bufferType->getOp())
+        {
+        case kIROp_HLSLRWStructuredBufferType:
+            nameSb << "RWStructuredBuffer_";
+            break;
+        case kIROp_HLSLAppendStructuredBufferType:
+            nameSb << "AppendStructuredBuffer_";
+            break;
+        case kIROp_HLSLConsumeStructuredBufferType:
+            nameSb << "ConsumeStructuredBuffer_";
+            break;
+        case kIROp_HLSLRasterizerOrderedStructuredBufferType:
+            nameSb << "RasterizerOrderedStructuredBuffer_";
+            break;
+        default:
+            nameSb << "StructuredBuffer_";
+            break;
+        }
+        getTypeNameHint(nameSb, elementType);
+        moduleBuilder.addNameHintDecoration(wrapperStruct, nameSb.getUnownedSlice());
+
+        LoweredStructuredBufferTypeInfo result;
+        result.wrapperStructType = wrapperStruct;
+        result.arrayKey = arrayKey;
+        result.unsizedArrayType = unsizedArrayType;
+
+        loweredStructuredBufferTypes[elementType] = result;
+        return result;
     }
 
     // Try to find a resource name in the index map.
@@ -483,17 +663,128 @@ struct BindlessResourceLoweringContext
             // Get binding index based on resource type (VkMutable bindings)
             int bindingIndex = getBindingIndexForResourceType(resourceType);
 
+            // Determine how to handle this resource type
+            auto cbufferType = as<IRConstantBufferType>(resourceType);
+            auto paramBlockType = as<IRParameterBlockType>(resourceType);
+            auto structuredBufferType = as<IRHLSLStructuredBufferTypeBase>(resourceType);
+
+            IRType* heapElementType = resourceType;
+            bool isUniformBuffer = false;
+            bool isStructuredBuffer = false;
+            LoweredStructuredBufferTypeInfo sbInfo = {};
+
+            if (cbufferType || paramBlockType)
+            {
+                // For ConstantBuffer<T> and ParameterBlock<T>:
+                // Create a heap of the inner element type T
+                heapElementType = as<IRUniformParameterGroupType>(resourceType)->getElementType();
+                isUniformBuffer = true;
+            }
+            else if (structuredBufferType)
+            {
+                // For StructuredBuffer<T> and RWStructuredBuffer<T>:
+                // Create a wrapper struct containing T[] and use that as the heap element type
+                sbInfo = getOrCreateStructuredBufferWrapperType(structuredBufferType);
+                heapElementType = sbInfo.wrapperStructType;
+                isStructuredBuffer = true;
+            }
+
             // Get or create the resource heap at module scope
-            auto resourceHeap = getOrCreateResourceHeap(bindingIndex, resourceType);
+            auto resourceHeap = getOrCreateResourceHeap(bindingIndex, heapElementType);
 
             // For SPIRV, unbounded arrays need pointer-based access:
             // 1. Get a pointer to the element (OpAccessChain)
-            // 2. Load from that pointer
+            // 2. Handle based on resource type
             auto elementPtr = builder.emitElementAddress(resourceHeap, heapIndex);
-            auto dereferencedResource = builder.emitLoad(resourceType, elementPtr);
 
-            // Replace this use with the dereferenced resource
-            builder.replaceOperand(use, dereferencedResource);
+            if (isStructuredBuffer)
+            {
+                // For structured buffers, we need to transform the operation that uses this buffer.
+                // The user of the global param should be a StructuredBufferLoad/Store/GetElementPtr
+                auto userOp = user->getOp();
+
+                if (userOp == kIROp_StructuredBufferLoad ||
+                    userOp == kIROp_RWStructuredBufferLoad ||
+                    userOp == kIROp_StructuredBufferLoadStatus ||
+                    userOp == kIROp_RWStructuredBufferLoadStatus)
+                {
+                    // StructuredBufferLoad(buffer, index) -> Load(FieldAddress(ElementAddress(heap, heapIdx), arrayKey)[index])
+                    auto loadIndex = user->getOperand(1);
+
+                    // Get pointer to the _data array field in the wrapper struct
+                    auto arrayFieldPtr = builder.emitFieldAddress(
+                        builder.getPtrType(sbInfo.unsizedArrayType, AddressSpace::StorageBuffer),
+                        elementPtr,
+                        sbInfo.arrayKey);
+
+                    // Get pointer to element at loadIndex
+                    auto elementAddr = builder.emitElementAddress(arrayFieldPtr, loadIndex);
+
+                    // Load the element
+                    auto loadedValue = builder.emitLoad(structuredBufferType->getElementType(), elementAddr);
+
+                    // Replace the entire StructuredBufferLoad instruction
+                    user->replaceUsesWith(loadedValue);
+                    user->removeAndDeallocate();
+                }
+                else if (userOp == kIROp_RWStructuredBufferStore)
+                {
+                    // RWStructuredBufferStore(buffer, index, value) -> Store(ptr, value)
+                    auto storeIndex = user->getOperand(1);
+                    auto storeValue = user->getOperand(2);
+
+                    // Get pointer to the _data array field
+                    auto arrayFieldPtr = builder.emitFieldAddress(
+                        builder.getPtrType(sbInfo.unsizedArrayType, AddressSpace::StorageBuffer),
+                        elementPtr,
+                        sbInfo.arrayKey);
+
+                    // Get pointer to element at storeIndex
+                    auto elementAddr = builder.emitElementAddress(arrayFieldPtr, storeIndex);
+
+                    // Store the value
+                    builder.emitStore(elementAddr, storeValue);
+
+                    // Remove the original store instruction
+                    user->removeAndDeallocate();
+                }
+                else if (userOp == kIROp_RWStructuredBufferGetElementPtr)
+                {
+                    // RWStructuredBufferGetElementPtr(buffer, index) -> ElementAddress(FieldAddress(...), index)
+                    auto gepIndex = user->getOperand(1);
+
+                    // Get pointer to the _data array field
+                    auto arrayFieldPtr = builder.emitFieldAddress(
+                        builder.getPtrType(sbInfo.unsizedArrayType, AddressSpace::StorageBuffer),
+                        elementPtr,
+                        sbInfo.arrayKey);
+
+                    // Get pointer to element at gepIndex
+                    auto elementAddr = builder.emitElementAddress(arrayFieldPtr, gepIndex);
+
+                    // Replace the GetElementPtr instruction
+                    user->replaceUsesWith(elementAddr);
+                    user->removeAndDeallocate();
+                }
+                else
+                {
+                    // Other uses - just provide the element pointer and hope for the best
+                    // This might need adjustment for specific cases
+                    builder.replaceOperand(use, elementPtr);
+                }
+            }
+            else if (isUniformBuffer)
+            {
+                // For uniform buffers, the element pointer IS the replacement.
+                // The original ConstantBuffer<T> acts like a pointer to T.
+                builder.replaceOperand(use, elementPtr);
+            }
+            else
+            {
+                // For other resources (textures, samplers), load the value from the pointer
+                auto replacement = builder.emitLoad(resourceType, elementPtr);
+                builder.replaceOperand(use, replacement);
+            }
         }
 
         // Record for metadata output

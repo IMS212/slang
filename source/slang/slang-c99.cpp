@@ -4,6 +4,9 @@
 
 #include "slang.h"
 #include "slang-com-ptr.h"
+#include "slang-linkable.h"
+#include "slang-ast-support-types.h"
+#include "slang-ast-decl.h"
 #include "../../source/compiler-core/slang-artifact-associated.h"
 
 #include <vector>
@@ -106,9 +109,12 @@ struct SlangcProgramImpl
     std::unordered_map<std::string, int> bindlessIndices;
 
     // Specialization state (pre-link)
+    // Positional args (traditional API)
     std::vector<std::string> specializationExprs;
     std::vector<slang::TypeReflection*> specializationTypes;
     std::vector<bool> specializationIsType;
+    // Named args (new API) - param name -> type expression
+    std::unordered_map<std::string, std::string> namedSpecializationArgs;
 
     // Cached composed program for param count query
     ComPtr<slang::IComponentType> composedProgram;
@@ -317,17 +323,20 @@ void SlangcCompilerImpl::ensureSession()
     targetDesc.profile = profile;
 
     sessionDesc.targets = &targetDesc;
-    slang::CompilerOptionEntry compilerOptions[2];
+    slang::CompilerOptionEntry compilerOptions[3];
     compilerOptions[0].name = slang::CompilerOptionName::BindlessSpaceIndex;
     compilerOptions[0].value.kind = slang::CompilerOptionValueKind::Int;
     compilerOptions[0].value.intValue0 = 0;
+    compilerOptions[0].name = slang::CompilerOptionName::LanguageVersion;
+    compilerOptions[0].value.kind = slang::CompilerOptionValueKind::Int;
+    compilerOptions[0].value.intValue0 = SLANG_LANGUAGE_VERSION_2026 ;
 
     compilerOptions[1].name = slang::CompilerOptionName::DebugInformation;
     compilerOptions[1].value.kind = slang::CompilerOptionValueKind::Int;
     compilerOptions[1].value.intValue0 = SLANG_DEBUG_INFO_LEVEL_STANDARD;
 
     sessionDesc.compilerOptionEntries = compilerOptions;
-    sessionDesc.compilerOptionEntryCount = 2;
+    sessionDesc.compilerOptionEntryCount = 3;
     sessionDesc.targetCount = 1;
 
     // Convert search paths
@@ -746,18 +755,31 @@ SLANGC_API int slangc_link(SlangcProgram program)
     // Handle specialization if arguments were provided
     ComPtr<slang::IComponentType> programToLink = composedProgram;
 
-    if (!impl->specializationExprs.empty() || !impl->specializationTypes.empty())
+    bool hasPositionalArgs = !impl->specializationExprs.empty() || !impl->specializationTypes.empty();
+    bool hasNamedArgs = !impl->namedSpecializationArgs.empty();
+
+    if (hasPositionalArgs && hasNamedArgs)
+    {
+        impl->appendError("Cannot mix positional and named specialization arguments");
+        return 0;
+    }
+
+    if (hasPositionalArgs)
     {
         auto paramCount = composedProgram->getSpecializationParamCount();
         size_t argCount = impl->specializationIsType.size();
 
-        if (argCount != (size_t)paramCount)
+        if (argCount > (size_t)paramCount)
         {
-            std::string msg = "Specialization argument count mismatch: expected " +
+            std::string msg = "Too many specialization arguments: expected at most " +
                 std::to_string(paramCount) + ", got " + std::to_string(argCount);
             impl->appendError(msg.c_str());
             return 0;
         }
+        // Note: fewer args than params is allowed - the constraint solver
+        // will try to infer missing arguments from constraints (e.g., if
+        // S : Shader<O> and S = MyShader : Shader<MyShaderOut>, then O can
+        // be inferred as MyShaderOut)
 
         std::vector<slang::SpecializationArg> specArgs;
         for (size_t i = 0; i < argCount; i++)
@@ -773,6 +795,59 @@ SLANGC_API int slangc_link(SlangcProgram program)
                 arg.kind = slang::SpecializationArg::Kind::Expr;
                 arg.expr = impl->specializationExprs[i].c_str();
             }
+            specArgs.push_back(arg);
+        }
+
+        ComPtr<slang::IComponentType> specializedProgram;
+        if (SLANG_FAILED(composedProgram->specialize(
+            specArgs.data(), (SlangInt)specArgs.size(),
+            specializedProgram.writeRef(), diagnostics.writeRef())))
+        {
+            impl->appendDiagnostics(diagnostics);
+            impl->appendError("Specialization failed");
+            return 0;
+        }
+        impl->appendDiagnostics(diagnostics);
+        programToLink = specializedProgram;
+    }
+    else if (hasNamedArgs)
+    {
+        // Named specialization args: look up each param by name
+        auto* componentType = static_cast<ComponentType*>(composedProgram.get());
+        auto paramCount = componentType->getSpecializationParamCount();
+
+        std::vector<slang::SpecializationArg> specArgs;
+        for (SlangInt i = 0; i < paramCount; i++)
+        {
+            auto& param = componentType->getSpecializationParam(i);
+            slang::SpecializationArg arg;
+            arg.kind = slang::SpecializationArg::Kind::Unknown;  // Default: let inference handle it
+            arg.expr = nullptr;
+
+            // Get param name based on flavor
+            const char* paramName = nullptr;
+            if (param.flavor == SpecializationParam::Flavor::GenericType)
+            {
+                if (auto typeParam = as<GenericTypeParamDecl>(param.object))
+                    paramName = typeParam->getName() ? typeParam->getName()->text.getBuffer() : nullptr;
+            }
+            else if (param.flavor == SpecializationParam::Flavor::GenericValue)
+            {
+                if (auto valParam = as<GenericValueParamDecl>(param.object))
+                    paramName = valParam->getName() ? valParam->getName()->text.getBuffer() : nullptr;
+            }
+
+            // Look up in named args map
+            if (paramName)
+            {
+                auto it = impl->namedSpecializationArgs.find(paramName);
+                if (it != impl->namedSpecializationArgs.end())
+                {
+                    arg.kind = slang::SpecializationArg::Kind::Expr;
+                    arg.expr = it->second.c_str();
+                }
+            }
+
             specArgs.push_back(arg);
         }
 
@@ -1208,6 +1283,16 @@ SLANGC_API void slangc_addSpecializationArgType(SlangcProgram program, SlangcTyp
     impl->needsRecompose = true;  // Invalidate cached composed program
 }
 
+SLANGC_API void slangc_setSpecializationArg(SlangcProgram program, const char* paramName, const char* typeExpr)
+{
+    auto impl = static_cast<SlangcProgramImpl*>(program);
+    if (!impl || !paramName || !typeExpr)
+        return;
+
+    impl->namedSpecializationArgs[paramName] = typeExpr;
+    impl->needsRecompose = true;
+}
+
 SLANGC_API void slangc_clearSpecializationArgs(SlangcProgram program)
 {
     auto impl = static_cast<SlangcProgramImpl*>(program);
@@ -1217,6 +1302,7 @@ SLANGC_API void slangc_clearSpecializationArgs(SlangcProgram program)
     impl->specializationExprs.clear();
     impl->specializationTypes.clear();
     impl->specializationIsType.clear();
+    impl->namedSpecializationArgs.clear();
     impl->needsRecompose = true;  // Invalidate cached composed program
 }
 

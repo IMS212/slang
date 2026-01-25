@@ -180,7 +180,7 @@ int main(int argc, char** argv)
     }
 
     /* Configure for GLSL output */
-    slangc_setTarget(compiler, SLANGC_TARGET_GLSL);
+    slangc_setTarget(compiler, SLANGC_TARGET_SPIRV_ASM);
 
     /* Load shader module */
     SlangcModule engine = loadMod(compiler, "engine", "D:\\slang\\examples\\test-shader\\engine.slang");
@@ -199,28 +199,21 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    /* Add module and entry point */
     slangc_addModule(program, engine);
     slangc_addModule(program, object);
     slangc_addModule(program, shader);
     slangc_addEntryPoint(program, engine, "vertexMain", SLANGC_STAGE_VERTEX);
     slangc_addEntryPoint(program, engine, "fragmentMain", SLANGC_STAGE_FRAGMENT);
+    slangc_setBindlessResolver(compiler, bindlessResolver, NULL);
 
-    /* Check how many specialization parameters are needed */
     int paramCount = slangc_getSpecializationParamCount(program);
     printf("Specialization parameters required: %d\n", paramCount);
 
-    /* Specialize the generic entry points with concrete types:
-     * vertexMain<In, V, S, O> -> RealVertexInput, RealVertex, MyShader, MyShaderOut
-     * fragmentMain<V, S, O>   -> RealVertex, MyShader, MyShaderOut
-     */
-    slangc_addSpecializationArgExpr(program, "RealVertexInput");
-    slangc_addSpecializationArgExpr(program, "RealVertex");
-    slangc_addSpecializationArgExpr(program, "MyShader");
-    slangc_addSpecializationArgExpr(program, "MyShaderOut");
-    slangc_addSpecializationArgExpr(program, "RealVertex");
-    slangc_addSpecializationArgExpr(program, "MyShader");
-    slangc_addSpecializationArgExpr(program, "MyShaderOut");
+    /* Use named specialization args - O is inferred from S : Shader<O> constraint */
+    slangc_setSpecializationArg(program, "In", "RealVertexInput");
+    slangc_setSpecializationArg(program, "V", "RealVertex");
+    slangc_setSpecializationArg(program, "S", "MyShaderPos");
+    /* No need to specify O (MyShaderOut) - inferred from MyShader : Shader<MyShaderOut> */
 
     /* Link */
     printf("\nLinking program...\n");
@@ -263,7 +256,7 @@ int main(int argc, char** argv)
             printf("Error: failed to open %s for writing\n", outputPath);
         }
     }
-    printf((char*) slangc_getBlobData(spirv));
+    //printf((char*) slangc_getBlobData(spirv));
 
     slangc_destroyProgram(program);
     slangc_destroyCompiler(compiler);

@@ -11,6 +11,12 @@ namespace Slang
         // Collect all MakeStruct instructions
         List<IRInst*> makeStructInsts;
 
+        // Track which varying locations are actually used by fragment shader inputs
+        HashSet<UInt> usedVaryingLocations;
+
+        // Track whether we found a fragment entry point in the module
+        bool hasFragmentEntryPoint = false;
+
         void collectMakeStructs();
         void collectMakeStructsInInst(IRInst* inst);
         void collectMakeStructsInFunc(IRFunc* func);
@@ -29,6 +35,16 @@ namespace Slang
         bool isInFragmentEntryPoint(IRInst* inst);
 
         void replaceUnusedOperands();
+
+        // Phase 3: Collect used varying locations from fragment shader inputs
+        void collectUsedVaryingLocations();
+
+        // Phase 4: Optimize vertex shader outputs
+        void optimizeVertexOutputs();
+
+        // Helper: Get varying location from layout decoration
+        // Returns -1 if not found
+        Int getVaryingLocation(IRInst* globalParam, LayoutResourceKind kind);
     };
 
     void UnusedFieldEliminationContext::collectMakeStructsInInst(IRInst* inst)
@@ -271,13 +287,52 @@ namespace Slang
                 // Check if this function is a fragment entry point
                 if (auto entryPoint = func->findDecoration<IREntryPointDecoration>())
                 {
-                    // Stage 5 is fragment shader (from slang-ir-entry-point-pass.cpp)
                     if (entryPoint->getProfile().getStage() == Stage::Fragment)
                         return true;
                 }
                 return false;
             }
             parent = parent->getParent();
+        }
+        return false;
+    }
+
+    bool isInVertexEntryPoint(IRInst* inst)
+    {
+        // Walk up to find the containing function
+        auto parent = inst->getParent();
+        while (parent)
+        {
+            if (auto func = as<IRFunc>(parent))
+            {
+                // Check if this function is a vertex entry point
+                if (auto entryPoint = func->findDecoration<IREntryPointDecoration>())
+                {
+                    if (entryPoint->getProfile().getStage() == Stage::Vertex)
+                        return true;
+                }
+                return false;
+            }
+            parent = parent->getParent();
+        }
+        return false;
+    }
+
+    bool isVertexOutput(IRGlobalParam* globalParam)
+    {
+        // Check if any store to this param is inside a vertex entry point
+        for (auto use = globalParam->firstUse; use; use = use->nextUse)
+        {
+            auto user = use->getUser();
+            if (user->getOp() == kIROp_Store)
+            {
+                auto store = as<IRStore>(user);
+                if (store->getPtr() == globalParam)
+                {
+                    if (isInVertexEntryPoint(store))
+                        return true;
+                }
+            }
         }
         return false;
     }
@@ -321,6 +376,157 @@ namespace Slang
         }
     }
 
+    Int UnusedFieldEliminationContext::getVaryingLocation(IRInst* globalParam, LayoutResourceKind kind)
+    {
+        auto layoutDecor = globalParam->findDecoration<IRLayoutDecoration>();
+        if (!layoutDecor)
+            return -1;
+
+        auto varLayout = as<IRVarLayout>(layoutDecor->getLayout());
+        if (!varLayout)
+            return -1;
+
+        auto offsetAttr = varLayout->findOffsetAttr(kind);
+        if (!offsetAttr)
+            return -1;
+
+        return (Int)offsetAttr->getOffset();
+    }
+
+    void UnusedFieldEliminationContext::collectUsedVaryingLocations()
+    {
+        // After Phase 2, MakeStruct operands that were unused have been replaced with
+        // defaults. We need to find which fragment input global params are STILL
+        // referenced (i.e., their loads are still used as MakeStruct operands).
+        //
+        // For each MakeStruct in a fragment entry point, trace back non-default operands
+        // to find which global params they load from, then collect those params' locations.
+
+        for (auto makeStruct : makeStructInsts)
+        {
+            // Only process MakeStructs in fragment entry points
+            if (!isInFragmentEntryPoint(makeStruct))
+                continue;
+
+            auto structType = as<IRStructType>(makeStruct->getDataType());
+            if (!structType)
+                continue;
+
+            // Only process varying struct types
+            if (!isVaryingStructType(structType))
+                continue;
+
+            // We found a varying struct MakeStruct in a fragment entry point
+            hasFragmentEntryPoint = true;
+
+            // For each operand in the MakeStruct, check if it's a load from a
+            // fragment input global param (vs a default value)
+            for (UInt i = 0; i < makeStruct->getOperandCount(); i++)
+            {
+                auto operand = makeStruct->getOperand(i);
+
+                // If the operand is a default construct, this field is not used
+                if (operand->getOp() == kIROp_DefaultConstruct ||
+                    operand->getOp() == kIROp_MakeVectorFromScalar)
+                {
+                    continue;
+                }
+
+                // Trace back to find if this operand comes from a load of a
+                // fragment input global param
+                IRInst* source = operand;
+
+                // Handle the case where operand might be a load directly
+                if (source->getOp() == kIROp_Load)
+                {
+                    auto loadInst = as<IRLoad>(source);
+                    auto loadPtr = loadInst->getPtr();
+
+                    auto globalParam = as<IRGlobalParam>(loadPtr);
+                    if (globalParam)
+                    {
+                        // Check if this is a fragment input
+                        auto paramType = globalParam->getDataType();
+                        if (paramType->getOp() == kIROp_BorrowInParamType)
+                        {
+                            // Skip built-in inputs
+                            if (!globalParam->findDecoration<IRGLPositionInputDecoration>())
+                            {
+                                Int location = getVaryingLocation(
+                                    globalParam,
+                                    LayoutResourceKind::VaryingInput);
+                                if (location >= 0)
+                                {
+                                    usedVaryingLocations.add((UInt)location);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    void UnusedFieldEliminationContext::optimizeVertexOutputs()
+    {
+        IRBuilder builder(module);
+
+        for (auto globalInst : module->getGlobalInsts())
+        {
+            auto globalParam = as<IRGlobalParam>(globalInst);
+            if (!globalParam)
+                continue;
+
+            // Check if this is a vertex output param (OutParamType)
+            auto paramType = globalParam->getDataType();
+            if (paramType->getOp() != kIROp_OutParamType)
+                continue;
+
+            // Skip built-in outputs (like gl_Position)
+            if (globalParam->findDecoration<IRGLPositionOutputDecoration>())
+                continue;
+
+            // Only process vertex outputs (not fragment outputs which are render targets)
+            if (!isVertexOutput(globalParam))
+                continue;
+
+            // Get the varying output location from layout
+            Int location = getVaryingLocation(globalParam, LayoutResourceKind::VaryingOutput);
+            if (location < 0)
+                continue;
+
+            // If this location is used by fragment shader, skip it
+            if (usedVaryingLocations.contains((UInt)location))
+                continue;
+
+            // This vertex output is not used by fragment shader.
+            // Find all stores to this param and replace the stored value with a default.
+            auto ptrType = as<IRPtrTypeBase>(paramType);
+            if (!ptrType)
+                continue;
+            auto valueType = ptrType->getValueType();
+
+            for (auto use = globalParam->firstUse; use; use = use->nextUse)
+            {
+                auto user = use->getUser();
+                if (user->getOp() == kIROp_Store)
+                {
+                    auto store = as<IRStore>(user);
+                    // Make sure this is a store TO the param (param is operand 0)
+                    if (store->getPtr() == globalParam)
+                    {
+                        builder.setInsertBefore(store);
+                        auto defaultVal = builder.emitDefaultConstruct(valueType);
+                        if (defaultVal)
+                        {
+                            store->setOperand(1, defaultVal);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     void eliminateUnusedStructFieldInits(IRModule* module)
     {
         UnusedFieldEliminationContext context;
@@ -330,7 +536,20 @@ namespace Slang
         context.collectMakeStructs();
 
         // Phase 2: For each MakeStruct, find unused fields and replace with defaults
+        // (fragment shader optimization - handles struct field elimination)
         context.replaceUnusedOperands();
+
+        // Phase 3: Collect used varying locations from fragment shader inputs
+        context.collectUsedVaryingLocations();
+
+        // Phase 4: Optimize vertex shader outputs that are not used by fragment shader
+        // Only run if we found a fragment entry point with a varying struct MakeStruct.
+        // If no such fragment entry point exists, don't optimize vertex outputs
+        // because we don't know which outputs will be used.
+        if (context.hasFragmentEntryPoint)
+        {
+            context.optimizeVertexOutputs();
+        }
 
         // DCE will be run separately to clean up dead code
     }

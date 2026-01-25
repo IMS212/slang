@@ -428,6 +428,11 @@ SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::specialize(
                     expandedArg.expr = checkedExpr;
             }
             break;
+        case slang::SpecializationArg::Kind::Unknown:
+            // Leave val and expr as nullptr - let inference handle this parameter
+            expandedArg.val = nullptr;
+            expandedArg.expr = nullptr;
+            break;
         default:
             sink.getBlobIfNeeded(outDiagnostics);
             return SLANG_FAIL;

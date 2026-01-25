@@ -320,16 +320,25 @@ SLANGC_API int slangc_getSpecializationParamCount(SlangcProgram program);
  */
 SLANGC_API SlangcType slangc_findTypeByName(SlangcModule module, const char* typeName);
 
-/* Add a specialization argument using a type expression string.
+/* Add a specialization argument using a type expression string (positional).
  * Call once for each specialization parameter before calling slangc_link.
  * Example: slangc_addSpecializationArgExpr(program, "Grayscale");
  */
 SLANGC_API void slangc_addSpecializationArgExpr(SlangcProgram program, const char* typeExpr);
 
-/* Add a specialization argument using a type handle from slangc_findTypeByName.
+/* Add a specialization argument using a type handle from slangc_findTypeByName (positional).
  * Call once for each specialization parameter before calling slangc_link.
  */
 SLANGC_API void slangc_addSpecializationArgType(SlangcProgram program, SlangcType type);
+
+/* Set a named specialization argument using a type expression string.
+ * Named args are matched by parameter name across all entry points.
+ * Parameters not specified will be inferred from constraints if possible.
+ * Example: slangc_setSpecializationArg(program, "S", "MyShader");
+ *
+ * Named and positional args cannot be mixed - use one style or the other.
+ */
+SLANGC_API void slangc_setSpecializationArg(SlangcProgram program, const char* paramName, const char* typeExpr);
 
 /* Clear all specialization arguments to reuse the program with different types.
  * This allows re-linking the same program with different specializations.

@@ -1660,10 +1660,9 @@ RefPtr<ComponentType::SpecializationInfo> EntryPoint::_validateSpecializationArg
                     genericArgs.add(intExpr);
                 }
             }
-            else
-            {
-                sink->diagnose(SourceLoc(), Diagnostics::invalidFormOfSpecializationArg, ii + 1);
-            }
+            // If both expr and val are null, don't add anything - let the constraint
+            // solver infer this parameter. This enables named specialization args
+            // where unspecified params are inferred from constraints.
         }
         auto genAppExpr = astBuilder->create<GenericAppExpr>();
         auto genExpr = astBuilder->create<VarExpr>();
