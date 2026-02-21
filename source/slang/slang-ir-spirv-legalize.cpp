@@ -1454,6 +1454,44 @@ struct SPIRVLegalizationContext : public SourceEmitterBase
         inst->insertAtEnd(m_module->getModuleInst());
     }
 
+    void processDefaultConstruct(IRInst* inst)
+    {
+        // Handle DefaultConstruct for DescriptorHandleType.
+        // In SPIRV, DescriptorHandle is lowered to uint64 (spvBindlessTextureNV) or uint2.
+        // A default-constructed handle should be a zero value.
+        auto type = inst->getDataType();
+        if (type && type->getOp() == kIROp_DescriptorHandleType)
+        {
+            IRBuilder builder(m_module);
+            builder.setInsertBefore(inst);
+            auto targetCaps = m_sharedContext->m_targetProgram->getTargetReq()->getTargetCaps();
+
+            IRInst* castInst = nullptr;
+            if (targetCaps.implies(CapabilityAtom::spvBindlessTextureNV))
+            {
+                // spvBindlessTextureNV: DescriptorHandle is uint64_t
+                auto uint64Type = builder.getUInt64Type();
+                auto zero64 = builder.getIntValue(uint64Type, 0);
+                castInst =
+                    builder.emitIntrinsicInst(type, kIROp_CastUInt64ToDescriptorHandle, 1, &zero64);
+            }
+            else
+            {
+                // Default: DescriptorHandle is uint2
+                auto uint32Type = builder.getUIntType();
+                auto zero = builder.getIntValue(uint32Type, 0);
+                auto vecType =
+                    builder.getVectorType(uint32Type, builder.getIntValue(builder.getIntType(), 2));
+                auto zeroVec =
+                    builder.emitIntrinsicInst(vecType, kIROp_MakeVectorFromScalar, 1, &zero);
+                castInst =
+                    builder.emitIntrinsicInst(type, kIROp_CastUInt2ToDescriptorHandle, 1, &zeroVec);
+            }
+            inst->replaceUsesWith(castInst);
+            inst->removeAndDeallocate();
+        }
+    }
+
     void processConstructor(IRInst* inst)
     {
         maybeHoistConstructInstToGlobalScope(inst);
@@ -1870,6 +1908,9 @@ struct SPIRVLegalizationContext : public SourceEmitterBase
                 break;
             case kIROp_PtrLit:
                 processPtrLit(inst);
+                break;
+            case kIROp_DefaultConstruct:
+                processDefaultConstruct(inst);
                 break;
             // kIROp_UnconditionalBranch is handled in default case that only
             // adds children inst and not target inst to work list.
@@ -2614,6 +2655,102 @@ void insertFragmentShaderInterlock(SPIRVEmitSharedContext* context, IRModule* mo
     }
 }
 
+// For SPIRV versions that emit discard as OpKill (a terminator), we need to
+// handle unreachable code after discard. Since OpKill terminates execution,
+// any code after it is unreachable. We replace the block's terminator with
+// unreachable and remove intermediate instructions.
+//
+// This applies when shouldEmitDiscardAsDemote() returns false, meaning:
+// - SPIRV version is < 1.6 AND
+// - The SPV_EXT_demote_to_helper_invocation extension is not being used
+//
+// In these cases, discard becomes OpKill which is a terminator instruction.
+// For SPIRV 1.6+ or with the demote extension, discard becomes
+// OpDemoteToHelperInvocation which is NOT a terminator, so code can continue.
+static void removeUnreachableCodeAfterDiscardForOpKill(
+    SPIRVEmitSharedContext* context,
+    IRModule* module)
+{
+    // If discard will be emitted as OpDemoteToHelperInvocation (not a terminator),
+    // we don't need to remove code after it
+    if (context->shouldEmitDiscardAsDemote())
+        return;
+
+    IRBuilder builder(module);
+
+    for (auto globalInst : module->getGlobalInsts())
+    {
+        if (auto func = as<IRGlobalValueWithCode>(globalInst))
+        {
+            for (auto block : func->getBlocks())
+            {
+                // Find if there's a discard in this block
+                IRInst* discardInst = nullptr;
+                for (auto inst : block->getOrdinaryInsts())
+                {
+                    if (inst->getOp() == kIROp_Discard)
+                    {
+                        discardInst = inst;
+                        break;
+                    }
+                }
+
+                if (!discardInst)
+                    continue;
+
+                // Get the block's terminator
+                auto terminator = block->getTerminator();
+                if (!terminator)
+                    continue;
+
+                // Check if there are instructions between discard and terminator
+                bool hasInstructionsBetween = false;
+                bool foundDiscard = false;
+                for (auto inst : block->getOrdinaryInsts())
+                {
+                    if (foundDiscard && inst != terminator)
+                    {
+                        hasInstructionsBetween = true;
+                        break;
+                    }
+                    else if (inst == discardInst)
+                    {
+                        foundDiscard = true;
+                    }
+                }
+
+                if (!hasInstructionsBetween)
+                    continue;
+
+                // Remove all instructions after discard and replace terminator with unreachable
+                List<IRInst*> toRemove;
+                foundDiscard = false;
+                for (auto inst : block->getOrdinaryInsts())
+                {
+                    if (foundDiscard)
+                    {
+                        toRemove.add(inst);
+                    }
+                    else if (inst == discardInst)
+                    {
+                        foundDiscard = true;
+                    }
+                }
+
+                // Remove the collected instructions
+                for (auto inst : toRemove)
+                {
+                    inst->removeAndDeallocate();
+                }
+
+                // Add unreachable terminator after discard
+                builder.setInsertAfter(discardInst);
+                builder.emitUnreachable();
+            }
+        }
+    }
+}
+
 void legalizeIRForSPIRV(
     SPIRVEmitSharedContext* context,
     IRModule* module,
@@ -2623,6 +2760,16 @@ void legalizeIRForSPIRV(
     SLANG_UNUSED(entryPoints);
     legalizeSPIRV(context, module, codeGenContext);
     simplifyIRForSpirvLegalization(context->m_targetProgram, codeGenContext->getSink(), module);
+
+    // Remove unreachable code after discard for SPIRV versions that emit OpKill.
+    // This is necessary because OpKill is a terminator and cannot have instructions
+    // after it in the same block. This only applies when targeting SPIRV < 1.6
+    // without the SPV_EXT_demote_to_helper_invocation extension.
+    removeUnreachableCodeAfterDiscardForOpKill(context, module);
+
+    // Run DCE to clean up any values that became unused after removing unreachable code
+    eliminateDeadCode(module);
+
     buildEntryPointReferenceGraph(context->m_referencingEntryPoints, module);
     insertFragmentShaderInterlock(context, module);
 }

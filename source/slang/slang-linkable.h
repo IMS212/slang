@@ -185,6 +185,10 @@ public:
         SlangInt targetIndex,
         slang::ICompileResult** outCompileResult,
         slang::IBlob** outDiagnostics = nullptr) SLANG_OVERRIDE;
+    SLANG_NO_THROW SlangResult SLANG_MCALL getTargetHostCallable(
+        int targetIndex,
+        ISlangSharedLibrary** outSharedLibrary,
+        slang::IBlob** outDiagnostics) SLANG_OVERRIDE;
 
     //
     // slang::IComponentType3 interface

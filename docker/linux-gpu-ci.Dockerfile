@@ -1,7 +1,7 @@
 # Linux GPU CI Container Image
 #
-# Base image with CUDA 12.5.1 for GPU testing on self-hosted runners
-# Requires driver 550.54.15 or newer
+# Base image with CUDA 13.0.1 for GPU testing on self-hosted runners
+# Requires driver 580.65.06 or newer
 #
 # Used by:
 # - .github/workflows/ci-slang-build-container.yml
@@ -9,10 +9,20 @@
 # - .github/workflows/copilot-setup-steps.yml
 #
 # Build and push:
-#   docker build -f docker/linux-gpu-ci.Dockerfile -t ghcr.io/shader-slang/slang-linux-gpu-ci:v1.2.0 .
-#   docker push ghcr.io/shader-slang/slang-linux-gpu-ci:v1.2.0
+#   docker build -f docker/linux-gpu-ci.Dockerfile -t ghcr.io/shader-slang/slang-linux-gpu-ci:v1.3.0 .
+#   docker push ghcr.io/shader-slang/slang-linux-gpu-ci:v1.3.0
+#
+# IMPORTANT: After pushing a new version, update all references in:
+#   - .github/workflows/ci-slang-build-container.yml
+#   - .github/workflows/ci-slang-test-container.yml
+#   - .github/workflows/ci-slangpy-tests-container.yml
+#
+# Find all references:
+#   grep -rn "ghcr.io/shader-slang/slang-linux-gpu-ci" .github/workflows/
+#
+# The check-container-consistency.yml workflow will verify all references match.
 
-FROM nvidia/cuda:12.5.1-devel-ubuntu22.04
+FROM nvidia/cuda:13.0.1-devel-ubuntu22.04
 
 # Install essential tools required for GitHub Actions and Copilot
 # - curl: for downloading Copilot runtime and dependencies
@@ -93,5 +103,5 @@ RUN echo "=== Installed Tools ===" && \
 
 # Set labels for identification
 LABEL org.opencontainers.image.source=https://github.com/shader-slang/slang
-LABEL org.opencontainers.image.description="Slang Linux GPU CI container with CUDA 12.5.1"
+LABEL org.opencontainers.image.description="Slang Linux GPU CI container with CUDA 13.0.1"
 LABEL org.opencontainers.image.licenses=MIT

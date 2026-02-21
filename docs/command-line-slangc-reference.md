@@ -490,7 +490,7 @@ Make data accessed through ConstantBuffer, ParameterBlock, StructuredBuffer, Byt
 
 
 <a id="fvk-b-shift"></a>
-### -fvk-b-shift, -fvk-s-shift, -fvk-t-shift, -fvk-u-shift
+### -fvk-&lt;vulkan-shift&gt;-shift
 
 **-fvk-&lt;[vulkan-shift](#vulkan-shift)&gt;-shift &lt;N&gt; &lt;space&gt;**
 
@@ -621,7 +621,7 @@ Sets a comma-separates list of architecture-specific features for the LLVM targe
 Downstream compiler options 
 
 <a id="none-path"></a>
-### -none-path, -fxc-path, -dxc-path, -glslang-path, -spirv-dis-path, -clang-path, -visualstudio-path, -gcc-path, -genericcpp-path, -nvrtc-path, -llvm-path, -spirv-opt-path, -metal-path, -tint-path
+### -&lt;compiler&gt;-path
 
 **-&lt;[compiler](#compiler)&gt;-path &lt;path&gt;**
 
@@ -895,6 +895,19 @@ Enable experimental features (loading builtin neural module)
 Enable experimental rich diagnostics with enhanced formatting and details 
 
 
+<a id="enable-machine-readable-diagnostics"></a>
+### -enable-machine-readable-diagnostics
+Enable machine-readable diagnostic output in tab-separated format 
+
+
+<a id="diagnostic-color"></a>
+### -diagnostic-color
+
+**-diagnostic-color &lt;always|never|auto&gt;**
+
+Control colored diagnostic output (auto uses color if stderr is a tty) 
+
+
 
 <a id="Internal"></a>
 ## Internal
@@ -981,6 +994,11 @@ Enable liveness tracking. Places SLANG_LIVE_START, and SLANG_LIVE_END in output 
 <a id="loop-inversion"></a>
 ### -loop-inversion
 Enable loop inversion in the code-gen optimization. Default is off 
+
+
+<a id="whole-program"></a>
+### -whole-program
+Generate code for all entry points in a single output (library mode). 
 
 
 
@@ -1291,6 +1309,8 @@ A capability describes an optional feature that a target may or may not support.
 * `SPV_NV_tensor_addressing` : enables the SPV_NV_tensor_addressing extension 
 * `SPV_NV_cooperative_matrix2` : enables the SPV_NV_cooperative_matrix2 extension 
 * `SPV_NV_bindless_texture` : enables the SPV_NV_bindless_texture extension 
+* `SPV_EXT_float8` : enables the SPV_EXT_float8 extension 
+* `SPV_KHR_bfloat16` : enables the SPV_KHR_bfloat16 extension 
 * `spvDeviceGroup` 
 * `spvAtomicFloat32AddEXT` 
 * `spvAtomicFloat16AddEXT` 
@@ -1305,6 +1325,8 @@ A capability describes an optional feature that a target may or may not support.
 * `spvSparseResidency` 
 * `spvImageFootprintNV` 
 * `spvMinLod` 
+* `spvFloat8EXT` 
+* `spvBFloat16KHR` 
 * `spvFragmentShaderPixelInterlockEXT` 
 * `spvFragmentBarycentricKHR` 
 * `spvFragmentFullyCoveredEXT` 
@@ -1501,6 +1523,7 @@ A capability describes an optional feature that a target may or may not support.
 * `tensor_addressing` 
 * `cooperative_matrix_2` 
 * `vk_mem_model` 
+* `descriptor_handle` 
 * `pixel` 
 * `tesscontrol` 
 * `tesseval` 
@@ -1609,6 +1632,8 @@ A capability describes an optional feature that a target may or may not support.
 * `cuda_sm_7_0` 
 * `cuda_sm_8_0` 
 * `cuda_sm_9_0` 
+* `atomic_reduce` 
+* `atomic_bfloat16` 
 * `METAL_2_3` 
 * `METAL_2_4` 
 * `METAL_3_0` 
