@@ -323,20 +323,25 @@ void SlangcCompilerImpl::ensureSession()
     targetDesc.profile = profile;
 
     sessionDesc.targets = &targetDesc;
-    slang::CompilerOptionEntry compilerOptions[3];
+    slang::CompilerOptionEntry compilerOptions[5];
     compilerOptions[0].name = slang::CompilerOptionName::BindlessSpaceIndex;
     compilerOptions[0].value.kind = slang::CompilerOptionValueKind::Int;
     compilerOptions[0].value.intValue0 = 0;
-    compilerOptions[0].name = slang::CompilerOptionName::LanguageVersion;
-    compilerOptions[0].value.kind = slang::CompilerOptionValueKind::Int;
-    compilerOptions[0].value.intValue0 = SLANG_LANGUAGE_VERSION_2026 ;
-
-    compilerOptions[1].name = slang::CompilerOptionName::DebugInformation;
+    compilerOptions[1].name = slang::CompilerOptionName::LanguageVersion;
     compilerOptions[1].value.kind = slang::CompilerOptionValueKind::Int;
-    compilerOptions[1].value.intValue0 = SLANG_DEBUG_INFO_LEVEL_STANDARD;
+    compilerOptions[1].value.intValue0 = SLANG_LANGUAGE_VERSION_2026 ;
+    compilerOptions[2].name = slang::CompilerOptionName::DebugInformation;
+    compilerOptions[2].value.kind = slang::CompilerOptionValueKind::Int;
+    compilerOptions[2].value.intValue0 = SLANG_DEBUG_INFO_LEVEL_STANDARD;
+    compilerOptions[3].name = slang::CompilerOptionName::GLSLForceScalarLayout;
+    compilerOptions[3].value.kind = slang::CompilerOptionValueKind::Int;
+    compilerOptions[3].value.intValue0 = 1;
+    compilerOptions[4].name = slang::CompilerOptionName::MatrixLayoutRow;
+    compilerOptions[4].value.kind = slang::CompilerOptionValueKind::Int;
+    compilerOptions[4].value.intValue0 = 1;
 
     sessionDesc.compilerOptionEntries = compilerOptions;
-    sessionDesc.compilerOptionEntryCount = 3;
+    sessionDesc.compilerOptionEntryCount = 5;
     sessionDesc.targetCount = 1;
 
     // Convert search paths

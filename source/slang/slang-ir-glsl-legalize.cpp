@@ -5106,6 +5106,26 @@ void legalizeConstantBufferLoadForGLSL(IRModule* module)
     }
 }
 
+static IRGlobalVar* findExistingTaskPayloadWorkgroupVar(IRModule* module, IRType* payloadType)
+{
+    for (auto globalInst : module->getGlobalInsts())
+    {
+        auto globalVar = as<IRGlobalVar>(globalInst);
+        if (!globalVar)
+            continue;
+
+        auto ptrType = as<IRPtrTypeBase>(globalVar->getDataType());
+        if (!ptrType)
+            continue;
+
+        if (ptrType->getAddressSpace() != AddressSpace::TaskPayloadWorkgroup)
+            continue;
+
+        if (ptrType->getValueType() == payloadType)
+            return globalVar;
+    }
+    return nullptr;
+}
 
 void legalizeDispatchMeshPayloadForGLSL(IRModule* module)
 {
@@ -5148,42 +5168,60 @@ void legalizeDispatchMeshPayloadForGLSL(IRModule* module)
                 const auto payloadType = payloadPtrType->getValueType();
                 SLANG_ASSERT(payloadType);
 
+                // Check if mesh shader already created a TaskPayloadWorkgroup global
+                // for this payload type. If so, reuse it to avoid duplicate variables
+                // in SPIR-V output.
+                IRGlobalVar* existingPayloadVar =
+                    findExistingTaskPayloadWorkgroupVar(module, payloadType);
+
                 const bool isGroupsharedGlobal =
                     payload->getParent() == module->getModuleInst() &&
                     composeGetters<IRGroupSharedRate>(payload, &IRInst::getRate);
                 if (isGroupsharedGlobal)
                 {
-                    // If it's a groupshared global, then we put it in the address
-                    // space we know to emit as taskPayloadSharedEXT instead (or
-                    // naturally fall through correctly for SPIR-V emit)
-                    //
-                    // Keep it as a groupshared rate qualified type so we don't
-                    // miss out on any further legalization requirement or
-                    // optimization opportunities.
-                    const auto payloadSharedPtrType = builder.getRateQualifiedType(
-                        builder.getGroupSharedRate(),
-                        builder.getPtrType(
-                            payloadPtrType->getOp(),
-                            payloadPtrType->getValueType(),
-                            AddressSpace::TaskPayloadWorkgroup));
-                    payload->setFullType(payloadSharedPtrType);
+                    if (existingPayloadVar)
+                    {
+                        // Reuse existing global created by mesh shader legalization:
+                        // store from groupshared into it and update the call argument.
+                        builder.setInsertBefore(call);
+                        builder.emitStore(existingPayloadVar, builder.emitLoad(payload));
+                        call->getArgs()[3].set(existingPayloadVar);
+                    }
+                    else
+                    {
+                        // If it's a groupshared global, then we put it in the address
+                        // space we know to emit as taskPayloadSharedEXT instead (or
+                        // naturally fall through correctly for SPIR-V emit)
+                        //
+                        // Keep it as a groupshared rate qualified type so we don't
+                        // miss out on any further legalization requirement or
+                        // optimization opportunities.
+                        const auto payloadSharedPtrType = builder.getRateQualifiedType(
+                            builder.getGroupSharedRate(),
+                            builder.getPtrType(
+                                payloadPtrType->getOp(),
+                                payloadPtrType->getValueType(),
+                                AddressSpace::TaskPayloadWorkgroup));
+                        payload->setFullType(payloadSharedPtrType);
+                    }
                 }
                 else
                 {
-                    // ...
-                    // If it's not a groupshared global, then create such a
-                    // parameter and store into the value being passed to this
-                    // call.
-                    builder.setInsertInto(module->getModuleInst());
-                    const auto v =
-                        builder.createGlobalVar(payloadType, AddressSpace::TaskPayloadWorkgroup);
-                    v->setFullType(builder.getRateQualifiedType(
-                        builder.getGroupSharedRate(),
-                        v->getFullType()));
+                    IRGlobalVar* v = existingPayloadVar;
+                    if (!v)
+                    {
+                        // If it's not a groupshared global and no existing
+                        // TaskPayloadWorkgroup global exists, create one.
+                        builder.setInsertInto(module->getModuleInst());
+                        v = builder.createGlobalVar(payloadType, AddressSpace::TaskPayloadWorkgroup);
+                        v->setFullType(builder.getRateQualifiedType(
+                            builder.getGroupSharedRate(),
+                            v->getFullType()));
 
-                    // Add a name hint to the global variable for debuginfo.
-                    // Use a distinctive name to avoid confusion with the user's local variable.
-                    builder.addNameHintDecoration(v, toSlice("__EmitMeshTasks_Payload"));
+                        // Add a name hint to the global variable for debuginfo.
+                        // Use a distinctive name to avoid confusion with the user's local variable.
+                        builder.addNameHintDecoration(v, toSlice("__EmitMeshTasks_Payload"));
+                    }
 
                     builder.setInsertBefore(call);
                     builder.emitStore(v, builder.emitLoad(payload));
