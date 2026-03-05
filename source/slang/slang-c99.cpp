@@ -12,10 +12,35 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 #include <memory>
 
 using namespace Slang;
+
+static std::string normalizeSpecializationExpr(const char* expr)
+{
+    if (!expr)
+        return "";
+
+    std::string s(expr);
+    auto isSpace = [](unsigned char ch) { return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n'; };
+
+    size_t begin = 0;
+    while (begin < s.size() && isSpace((unsigned char)s[begin]))
+        ++begin;
+
+    size_t end = s.size();
+    while (end > begin && isSpace((unsigned char)s[end - 1]))
+        --end;
+
+    std::string trimmed = s.substr(begin, end - begin);
+    if (trimmed == "true")
+        return "1";
+    if (trimmed == "false")
+        return "0";
+    return s;
+}
 
 //
 // Internal structures
@@ -52,6 +77,14 @@ struct SlangcCompilerImpl
     // Bindless resolver callback (set once, used for all programs)
     SlangcBindlessResolverCallback bindlessResolver = nullptr;
     void* bindlessResolverUserData = nullptr;
+
+    // Bindless array resolver callback (set once, used for all programs)
+    SlangcBindlessArrayResolverCallback bindlessArrayResolver = nullptr;
+    void* bindlessArrayResolverUserData = nullptr;
+
+    // Bindless combined-sampler resolver callback (set once, used for all programs)
+    SlangcBindlessCombinedSamplerResolverCallback bindlessCombinedSamplerResolver = nullptr;
+    void* bindlessCombinedSamplerResolverUserData = nullptr;
 
     // Cache for bindless resolver results (resourceName:resourceType -> index)
     // Persists across programs to avoid redundant callback invocations
@@ -99,6 +132,18 @@ struct BindlessResolverWrapper
     Slang::Dictionary<Slang::String, int>* cache;  // Compiler's cache
 };
 
+struct BindlessArrayResolverWrapper
+{
+    SlangcBindlessArrayResolverCallback userCallback;
+    void* userCallbackData;
+};
+
+struct BindlessCombinedSamplerResolverWrapper
+{
+    SlangcBindlessCombinedSamplerResolverCallback userCallback;
+    void* userCallbackData;
+};
+
 struct SlangcProgramImpl
 {
     SlangcCompilerImpl* compiler;  // Back-reference to compiler
@@ -122,6 +167,8 @@ struct SlangcProgramImpl
 
     // Wrapper for passing resolver to internal API (created during link from compiler's resolver)
     std::unique_ptr<BindlessResolverWrapper> resolverWrapper;
+    std::unique_ptr<BindlessArrayResolverWrapper> arrayResolverWrapper;
+    std::unique_ptr<BindlessCombinedSamplerResolverWrapper> combinedSamplerResolverWrapper;
 
     // Post-link state
     ComPtr<slang::IComponentType> linkedProgram;
@@ -206,6 +253,37 @@ static int bindlessResolverWrapperCallback(
     }
 
     return result;
+}
+
+static int bindlessArrayResolverWrapperCallback(
+    const char* resourceName,
+    slang::SlangBindlessResourceType resourceType,
+    int shaderArrayLength,
+    int* outResolvedArrayLength,
+    void* userData)
+{
+    auto* wrapper = static_cast<BindlessArrayResolverWrapper*>(userData);
+    if (!wrapper || !wrapper->userCallback)
+        return -1;
+
+    SlangcBindlessResourceType c99Type = static_cast<SlangcBindlessResourceType>(resourceType);
+    return wrapper->userCallback(
+        resourceName,
+        c99Type,
+        shaderArrayLength,
+        outResolvedArrayLength,
+        wrapper->userCallbackData);
+}
+
+static int bindlessCombinedSamplerResolverWrapperCallback(
+    const char* resourceName,
+    void* userData)
+{
+    auto* wrapper = static_cast<BindlessCombinedSamplerResolverWrapper*>(userData);
+    if (!wrapper || !wrapper->userCallback)
+        return -1;
+
+    return wrapper->userCallback(resourceName, wrapper->userCallbackData);
 }
 
 //
@@ -323,25 +401,26 @@ void SlangcCompilerImpl::ensureSession()
     targetDesc.profile = profile;
 
     sessionDesc.targets = &targetDesc;
-    slang::CompilerOptionEntry compilerOptions[5];
-    compilerOptions[0].name = slang::CompilerOptionName::BindlessSpaceIndex;
-    compilerOptions[0].value.kind = slang::CompilerOptionValueKind::Int;
-    compilerOptions[0].value.intValue0 = 0;
-    compilerOptions[1].name = slang::CompilerOptionName::LanguageVersion;
-    compilerOptions[1].value.kind = slang::CompilerOptionValueKind::Int;
-    compilerOptions[1].value.intValue0 = SLANG_LANGUAGE_VERSION_2026 ;
-    compilerOptions[2].name = slang::CompilerOptionName::DebugInformation;
-    compilerOptions[2].value.kind = slang::CompilerOptionValueKind::Int;
-    compilerOptions[2].value.intValue0 = SLANG_DEBUG_INFO_LEVEL_STANDARD;
-    compilerOptions[3].name = slang::CompilerOptionName::GLSLForceScalarLayout;
-    compilerOptions[3].value.kind = slang::CompilerOptionValueKind::Int;
-    compilerOptions[3].value.intValue0 = 1;
-    compilerOptions[4].name = slang::CompilerOptionName::MatrixLayoutRow;
-    compilerOptions[4].value.kind = slang::CompilerOptionValueKind::Int;
-    compilerOptions[4].value.intValue0 = 1;
+    std::vector<slang::CompilerOptionEntry> compilerOptions;
 
-    sessionDesc.compilerOptionEntries = compilerOptions;
-    sessionDesc.compilerOptionEntryCount = 5;
+    auto addIntOption = [&](slang::CompilerOptionName name, int value) {
+        slang::CompilerOptionEntry entry;
+        entry.name = name;
+        entry.value.kind = slang::CompilerOptionValueKind::Int;
+        entry.value.intValue0 = value;
+        compilerOptions.push_back(entry);
+    };
+
+    addIntOption(slang::CompilerOptionName::BindlessSpaceIndex,  0);
+    addIntOption(slang::CompilerOptionName::LanguageVersion,     SLANG_LANGUAGE_VERSION_2026);
+    addIntOption(slang::CompilerOptionName::DebugInformation,    SLANG_DEBUG_INFO_LEVEL_STANDARD);
+    addIntOption(slang::CompilerOptionName::GLSLForceScalarLayout, 1);
+    addIntOption(slang::CompilerOptionName::MatrixLayoutRow,     1);
+    addIntOption(slang::CompilerOptionName::EnableRichDiagnostics,     1);
+    addIntOption(slang::CompilerOptionName::EnableMachineReadableDiagnostics,     1);
+
+    sessionDesc.compilerOptionEntries = compilerOptions.data();
+    sessionDesc.compilerOptionEntryCount = static_cast<uint32_t>(compilerOptions.size());
     sessionDesc.targetCount = 1;
 
     // Convert search paths
@@ -696,6 +775,30 @@ SLANGC_API void slangc_setBindlessResolver(
     impl->bindlessResolverUserData = userData;
 }
 
+SLANGC_API void slangc_setBindlessArrayResolver(
+    SlangcCompiler compiler,
+    SlangcBindlessArrayResolverCallback callback,
+    void* userData)
+{
+    auto impl = static_cast<SlangcCompilerImpl*>(compiler);
+    if (!impl)
+        return;
+    impl->bindlessArrayResolver = callback;
+    impl->bindlessArrayResolverUserData = userData;
+}
+
+SLANGC_API void slangc_setBindlessCombinedSamplerResolver(
+    SlangcCompiler compiler,
+    SlangcBindlessCombinedSamplerResolverCallback callback,
+    void* userData)
+{
+    auto impl = static_cast<SlangcCompilerImpl*>(compiler);
+    if (!impl)
+        return;
+    impl->bindlessCombinedSamplerResolver = callback;
+    impl->bindlessCombinedSamplerResolverUserData = userData;
+}
+
 /*
  * Linking
  */
@@ -820,8 +923,18 @@ SLANGC_API int slangc_link(SlangcProgram program)
         // Named specialization args: look up each param by name
         auto* componentType = static_cast<ComponentType*>(composedProgram.get());
         auto paramCount = componentType->getSpecializationParamCount();
+        auto getDeclName = [](NodeBase* object) -> const char*
+        {
+            if (auto decl = as<Decl>(object))
+            {
+                auto name = decl->getName();
+                return name ? name->text.getBuffer() : nullptr;
+            }
+            return nullptr;
+        };
 
         std::vector<slang::SpecializationArg> specArgs;
+        std::unordered_set<std::string> matchedNamedArgs;
         for (SlangInt i = 0; i < paramCount; i++)
         {
             auto& param = componentType->getSpecializationParam(i);
@@ -835,11 +948,19 @@ SLANGC_API int slangc_link(SlangcProgram program)
             {
                 if (auto typeParam = as<GenericTypeParamDecl>(param.object))
                     paramName = typeParam->getName() ? typeParam->getName()->text.getBuffer() : nullptr;
+                else if (auto globalTypeParam = as<GlobalGenericParamDecl>(param.object))
+                    paramName = globalTypeParam->getName() ? globalTypeParam->getName()->text.getBuffer() : nullptr;
+                else
+                    paramName = getDeclName(param.object);
             }
             else if (param.flavor == SpecializationParam::Flavor::GenericValue)
             {
                 if (auto valParam = as<GenericValueParamDecl>(param.object))
                     paramName = valParam->getName() ? valParam->getName()->text.getBuffer() : nullptr;
+                else if (auto globalValParam = as<GlobalGenericValueParamDecl>(param.object))
+                    paramName = globalValParam->getName() ? globalValParam->getName()->text.getBuffer() : nullptr;
+                else
+                    paramName = getDeclName(param.object);
             }
 
             // Look up in named args map
@@ -850,10 +971,20 @@ SLANGC_API int slangc_link(SlangcProgram program)
                 {
                     arg.kind = slang::SpecializationArg::Kind::Expr;
                     arg.expr = it->second.c_str();
+                    matchedNamedArgs.insert(it->first);
                 }
             }
 
             specArgs.push_back(arg);
+        }
+
+        for (const auto& it : impl->namedSpecializationArgs)
+        {
+            if (matchedNamedArgs.find(it.first) == matchedNamedArgs.end())
+            {
+                impl->appendError(("Unknown specialization parameter: " + it.first).c_str());
+                return 0;
+            }
         }
 
         ComPtr<slang::IComponentType> specializedProgram;
@@ -915,6 +1046,45 @@ SLANGC_API int slangc_link(SlangcProgram program)
                 0,
                 bindlessResolverWrapperCallback,
                 impl->resolverWrapper.get());
+        }
+    }
+
+    ComPtr<slang::IComponentType4> linkedComp4;
+    if (SLANG_SUCCEEDED(linkedProgram->queryInterface(
+        slang::IComponentType4::getTypeGuid(),
+        (void**)linkedComp4.writeRef())))
+    {
+        if (compiler->bindlessArrayResolver)
+        {
+            impl->arrayResolverWrapper = std::make_unique<BindlessArrayResolverWrapper>();
+            impl->arrayResolverWrapper->userCallback = compiler->bindlessArrayResolver;
+            impl->arrayResolverWrapper->userCallbackData = compiler->bindlessArrayResolverUserData;
+
+            linkedComp4->setBindlessArrayResolver(
+                0,
+                bindlessArrayResolverWrapperCallback,
+                impl->arrayResolverWrapper.get());
+        }
+    }
+
+    ComPtr<slang::IComponentType5> linkedComp5;
+    if (SLANG_SUCCEEDED(linkedProgram->queryInterface(
+        slang::IComponentType5::getTypeGuid(),
+        (void**)linkedComp5.writeRef())))
+    {
+        if (compiler->bindlessCombinedSamplerResolver)
+        {
+            impl->combinedSamplerResolverWrapper =
+                std::make_unique<BindlessCombinedSamplerResolverWrapper>();
+            impl->combinedSamplerResolverWrapper->userCallback =
+                compiler->bindlessCombinedSamplerResolver;
+            impl->combinedSamplerResolverWrapper->userCallbackData =
+                compiler->bindlessCombinedSamplerResolverUserData;
+
+            linkedComp5->setBindlessCombinedSamplerResolver(
+                0,
+                bindlessCombinedSamplerResolverWrapperCallback,
+                impl->combinedSamplerResolverWrapper.get());
         }
     }
 
@@ -1270,7 +1440,7 @@ SLANGC_API void slangc_addSpecializationArgExpr(SlangcProgram program, const cha
     if (!impl || !typeExpr)
         return;
 
-    impl->specializationExprs.push_back(typeExpr);
+    impl->specializationExprs.push_back(normalizeSpecializationExpr(typeExpr));
     impl->specializationTypes.push_back(nullptr);
     impl->specializationIsType.push_back(false);
     impl->needsRecompose = true;  // Invalidate cached composed program
@@ -1294,7 +1464,7 @@ SLANGC_API void slangc_setSpecializationArg(SlangcProgram program, const char* p
     if (!impl || !paramName || !typeExpr)
         return;
 
-    impl->namedSpecializationArgs[paramName] = typeExpr;
+    impl->namedSpecializationArgs[paramName] = normalizeSpecializationExpr(typeExpr);
     impl->needsRecompose = true;
 }
 

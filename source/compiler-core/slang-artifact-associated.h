@@ -129,7 +129,7 @@ struct BindlessResourceInfo
 {
     TerminatedCharSlice name;       ///< Original resource name
     TerminatedCharSlice typeName;   ///< Type of the resource (e.g., "Texture2D", "RWStructuredBuffer")
-    SlangInt index;                 ///< Index in the bindless index buffer
+    SlangInt index;                 ///< Bindless descriptor heap index
     SlangResourceAccess access;     ///< Access mode (uses existing SlangResourceAccess enum from slang.h)
 };
 

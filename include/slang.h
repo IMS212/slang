@@ -4762,18 +4762,45 @@ Called during IR lowering (after DCE) for each actually-used resource.
 @param resourceName The name of the resource
 @param resourceType The type category (determines which heap binding)
 @param userData User-provided context pointer
-@return Index buffer slot for this resource, or -1 to skip (not bindless)
+@return Descriptor heap index for this resource, or -1 to skip (not bindless)
 */
 typedef int (*SlangBindlessResolverCallback)(
     const char* resourceName,
     SlangBindlessResourceType resourceType,
     void* userData);
 
+/** Callback type for resolving bindless resource array base indices.
+Called during IR lowering (after DCE) for each actually-used resource array.
+@param resourceName The name of the resource array
+@param resourceType The type category (determines which heap binding)
+@param shaderArrayLength The array length declared in shader, or -1 for unsized arrays
+@param outResolvedArrayLength Resolver must write resolved array length here
+@param userData User-provided context pointer
+@return Base descriptor heap index for this resource array, or -1 to skip (not bindless)
+*/
+typedef int (*SlangBindlessArrayResolverCallback)(
+    const char* resourceName,
+    SlangBindlessResourceType resourceType,
+    int shaderArrayLength,
+    int* outResolvedArrayLength,
+    void* userData);
+
+/** Callback type for resolving fixed sampler indices used when lowering
+combined texture-sampler resources (e.g. `Sampler2D`) to texture + sampler pairs.
+Called during IR lowering for each actually-used combined texture resource.
+@param resourceName The name of the combined texture resource
+@param userData User-provided context pointer
+@return Sampler descriptor heap index for this resource. Return < 0 to use default index 0.
+*/
+typedef int (*SlangBindlessCombinedSamplerResolverCallback)(
+    const char* resourceName,
+    void* userData);
+
 /** IComponentType3 provides support for bindless resource lowering.
 
-This interface allows setting a map from resource names to bindless index buffer indices.
-When set, the compiler will convert resources to use DescriptorHandle<T> with indices
-loaded from a StructuredBuffer<uint2> at set 1, binding 3.
+This interface allows setting a map from resource names to bindless descriptor indices.
+When set, the compiler will convert resources to use DescriptorHandle<T> and index
+the corresponding descriptor heap directly with those indices.
 
 The map should be set before calling link() or getEntryPointCode().
 */
@@ -4814,6 +4841,60 @@ struct IComponentType3 : public ISlangUnknown
         void* userData) = 0;
 };
     #define SLANG_UUID_IComponentType3 IComponentType3::getTypeGuid()
+
+/** IComponentType4 provides support for bindless resource array lowering.
+
+This interface allows setting a callback to resolve bindless base indices for
+arrayed resources (e.g. `Texture2D[]`).
+*/
+struct IComponentType4 : public ISlangUnknown
+{
+    SLANG_COM_INTERFACE(
+        0xa13b4fd1,
+        0xfde5,
+        0x41d8,
+        {0xb4, 0x71, 0xe0, 0x76, 0x38, 0x9e, 0x8b, 0x5f})
+
+    /** Set a bindless array resolver callback for dynamic base-index resolution.
+    The callback is invoked during IR lowering (after DCE) for each used resource array.
+
+    @param targetIndex The target index to configure
+    @param callback The array resolver callback function
+    @param userData User data passed to the callback
+    @return SLANG_OK on success
+    */
+    virtual SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessArrayResolver(
+        SlangInt targetIndex,
+        SlangBindlessArrayResolverCallback callback,
+        void* userData) = 0;
+};
+    #define SLANG_UUID_IComponentType4 IComponentType4::getTypeGuid()
+
+/** IComponentType5 provides support for selecting fixed sampler indices
+for bindless lowering of combined texture-sampler resources.
+*/
+struct IComponentType5 : public ISlangUnknown
+{
+    SLANG_COM_INTERFACE(
+        0xe6e3f5bf,
+        0x8d3b,
+        0x4ad2,
+        {0x96, 0x17, 0xf4, 0x9f, 0x0a, 0x87, 0x1b, 0x66})
+
+    /** Set a callback for resolving the sampler descriptor index used when
+    lowering combined texture-sampler resources to texture + sampler pairs.
+
+    @param targetIndex The target index to configure
+    @param callback The combined-sampler resolver callback function
+    @param userData User data passed to the callback
+    @return SLANG_OK on success
+    */
+    virtual SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessCombinedSamplerResolver(
+        SlangInt targetIndex,
+        SlangBindlessCombinedSamplerResolverCallback callback,
+        void* userData) = 0;
+};
+    #define SLANG_UUID_IComponentType5 IComponentType5::getTypeGuid()
 
 /** A module is the granularity of shader code compilation and loading.
 

@@ -114,7 +114,7 @@ public:
 
     /// Set the resource name to bindless index mapping.
     /// Resources matching names in this map will be converted to
-    /// DescriptorHandle lookups from an index buffer at set 1, binding 3.
+    /// DescriptorHandle lookups with direct descriptor heap indices.
     void setBindlessResourceIndexMap(const Dictionary<String, int>& map)
     {
         m_bindlessResourceIndexMap = map;
@@ -135,6 +135,26 @@ public:
         m_bindlessResolverCache = cache;
     }
 
+    /// Set the bindless array resolver callback for dynamic base-index resolution.
+    /// The callback is invoked during IR lowering (after DCE) for each used resource array.
+    void setBindlessArrayResolver(
+        BindlessArrayResolverCallback callback,
+        void* userData)
+    {
+        m_bindlessArrayResolver = callback;
+        m_bindlessArrayResolverUserData = userData;
+    }
+
+    /// Set the callback for selecting fixed sampler indices when lowering
+    /// combined texture-sampler resources to texture + sampler pairs.
+    void setBindlessCombinedSamplerResolver(
+        BindlessCombinedSamplerResolverCallback callback,
+        void* userData)
+    {
+        m_bindlessCombinedSamplerResolver = callback;
+        m_bindlessCombinedSamplerResolverUserData = userData;
+    }
+
     /// Map of resource names to bindless indices for conversion.
     /// This is public so IR passes can access it directly.
     Dictionary<String, int> m_bindlessResourceIndexMap;
@@ -147,6 +167,16 @@ public:
     /// Pointer to external cache (owned by caller, e.g., C99 compiler).
     /// Key format is "resourceName:resourceType" where resourceType is the enum value.
     Dictionary<String, int>* m_bindlessResolverCache = nullptr;
+
+    /// Bindless array resolver callback for dynamic array base-index resolution.
+    /// Called during IR lowering for each resource array that needs a bindless base index.
+    BindlessArrayResolverCallback m_bindlessArrayResolver = nullptr;
+    void* m_bindlessArrayResolverUserData = nullptr;
+
+    /// Callback for selecting sampler descriptor indices when lowering combined
+    /// texture-sampler resources to texture + sampler pairs.
+    BindlessCombinedSamplerResolverCallback m_bindlessCombinedSamplerResolver = nullptr;
+    void* m_bindlessCombinedSamplerResolverUserData = nullptr;
 
 private:
     RefPtr<IRModule> createIRModuleForLayout(DiagnosticSink* sink);

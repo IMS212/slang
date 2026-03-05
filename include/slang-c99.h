@@ -117,6 +117,32 @@ typedef int (*SlangcBindlessResolverCallback)(
 );
 
 /*
+ * Bindless array resolver callback.
+ * Called during linking to resolve base indices for arrayed resources.
+ * `shaderArrayLength` is -1 for unsized arrays.
+ * Implementations must write the resolved array length to `outResolvedArrayLength`.
+ * Return the descriptor base index for this array, or -1 to skip (not bindless).
+ */
+typedef int (*SlangcBindlessArrayResolverCallback)(
+    const char* resourceName,
+    SlangcBindlessResourceType resourceType,
+    int shaderArrayLength,
+    int* outResolvedArrayLength,
+    void* userData
+);
+
+/*
+ * Bindless combined-sampler resolver callback.
+ * Called during linking for combined texture-sampler resources (e.g. Sampler2D)
+ * to choose the sampler descriptor index used after lowering to texture + sampler.
+ * Return < 0 to use default sampler index 0.
+ */
+typedef int (*SlangcBindlessCombinedSamplerResolverCallback)(
+    const char* resourceName,
+    void* userData
+);
+
+/*
  * File loading callback.
  * Returns pointer to file contents and sets *outSize.
  * Returns NULL on failure.
@@ -231,6 +257,26 @@ SLANGC_API void slangc_setBindlessResourceIndex(
 SLANGC_API void slangc_setBindlessResolver(
 SlangcCompiler compiler,
     SlangcBindlessResolverCallback callback,
+    void* userData
+);
+
+/*
+ * Set a bindless array resolver callback for arrayed resources (e.g. Texture2D[]).
+ * The callback is invoked during linking for each used resource array.
+ */
+SLANGC_API void slangc_setBindlessArrayResolver(
+    SlangcCompiler compiler,
+    SlangcBindlessArrayResolverCallback callback,
+    void* userData
+);
+
+/*
+ * Set a bindless combined-sampler resolver callback.
+ * This callback picks the sampler descriptor index used for bindless Sampler2D lowering.
+ */
+SLANGC_API void slangc_setBindlessCombinedSamplerResolver(
+    SlangcCompiler compiler,
+    SlangcBindlessCombinedSamplerResolverCallback callback,
     void* userData
 );
 

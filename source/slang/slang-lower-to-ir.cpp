@@ -9369,12 +9369,26 @@ struct DeclLoweringVisitor : DeclVisitor<DeclLoweringVisitor, LoweredValInfo>
         addTargetIntrinsicDecorations(nullptr, irParam, decl);
 
         bool hasLayoutSemantic = false;
+        bool hasExplicitVulkanBinding = false;
         bool isSpecializationConstant = false;
         for (auto modifier : decl->modifiers)
         {
             if (as<HLSLLayoutSemantic>(modifier))
             {
                 hasLayoutSemantic = true;
+            }
+            else if (auto glslBindingAttr = as<GLSLBindingAttribute>(modifier))
+            {
+                if (glslBindingAttr->keywordName)
+                {
+                    auto keyword = glslBindingAttr->keywordName->text.getUnownedSlice();
+                    if (
+                        keyword == toSlice("vk_binding") ||
+                        keyword == toSlice("vk::binding"))
+                    {
+                        hasExplicitVulkanBinding = true;
+                    }
+                }
             }
             else if (
                 as<SpecializationConstantAttribute>(modifier) ||
@@ -9385,6 +9399,8 @@ struct DeclLoweringVisitor : DeclVisitor<DeclLoweringVisitor, LoweredValInfo>
         }
         if (hasLayoutSemantic)
             builder->addHasExplicitHLSLBindingDecoration(irParam);
+        if (hasExplicitVulkanBinding)
+            builder->addHasExplicitVulkanBindingDecoration(irParam);
 
         // A global variable's SSA value is a *pointer* to
         // the underlying storage.

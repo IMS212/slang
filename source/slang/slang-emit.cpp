@@ -1442,7 +1442,9 @@ Result linkAndOptimizeIR(
     // Lower global resources to bindless descriptor handles if configured.
     // This runs after legalizeResourceTypes (so struct members are hoisted)
     // and after DCE (so only actually-used resources are converted).
-    if (targetProgram->m_bindlessResourceIndexMap.getCount() > 0 || targetProgram->m_bindlessResolver)
+    if (targetProgram->m_bindlessResourceIndexMap.getCount() > 0 ||
+        targetProgram->m_bindlessResolver ||
+        targetProgram->m_bindlessArrayResolver)
     {
         SLANG_PASS(lowerBindlessResources, targetProgram, sink, &bindlessConvertedResources);
         // Bindless lowering creates GetDynamicResourceHeap instructions that need lowering

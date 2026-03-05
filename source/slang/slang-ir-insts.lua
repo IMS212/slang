@@ -1598,6 +1598,7 @@ local insts = {
 				},
 			},
 			{ HasExplicitHLSLBinding = { struct_name = "HasExplicitHLSLBindingDecoration" } },
+			{ HasExplicitVulkanBinding = { struct_name = "HasExplicitVulkanBindingDecoration" } },
 			{ DefaultValue = { struct_name = "DefaultValueDecoration", min_operands = 1 } },
 			{
 				readNone = { struct_name = "ReadNoneDecoration" },

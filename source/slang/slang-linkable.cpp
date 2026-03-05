@@ -110,6 +110,10 @@ ISlangUnknown* ComponentType::getInterface(Guid const& guid)
         return static_cast<slang::IComponentType2*>(this);
     if (guid == IComponentType3::getTypeGuid())
         return static_cast<slang::IComponentType3*>(this);
+    if (guid == IComponentType4::getTypeGuid())
+        return static_cast<slang::IComponentType4*>(this);
+    if (guid == IComponentType5::getTypeGuid())
+        return static_cast<slang::IComponentType5*>(this);
     return nullptr;
 }
 
@@ -595,6 +599,38 @@ SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::setBindlessResolver(
 
     // BindlessResolverCallback is a typedef for SlangBindlessResolverCallback
     targetProgram->setBindlessResolver(callback, userData, nullptr);
+
+    return SLANG_OK;
+}
+
+SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::setBindlessArrayResolver(
+    Int targetIndex,
+    slang::SlangBindlessArrayResolverCallback callback,
+    void* userData)
+{
+    auto linkage = getLinkage();
+    if (targetIndex < 0 || targetIndex >= linkage->targets.getCount())
+        return SLANG_E_INVALID_ARG;
+
+    auto target = linkage->targets[targetIndex];
+    auto targetProgram = getTargetProgram(target);
+    targetProgram->setBindlessArrayResolver(callback, userData);
+
+    return SLANG_OK;
+}
+
+SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::setBindlessCombinedSamplerResolver(
+    Int targetIndex,
+    slang::SlangBindlessCombinedSamplerResolverCallback callback,
+    void* userData)
+{
+    auto linkage = getLinkage();
+    if (targetIndex < 0 || targetIndex >= linkage->targets.getCount())
+        return SLANG_E_INVALID_ARG;
+
+    auto target = linkage->targets[targetIndex];
+    auto targetProgram = getTargetProgram(target);
+    targetProgram->setBindlessCombinedSamplerResolver(callback, userData);
 
     return SLANG_OK;
 }

@@ -2,6 +2,7 @@
 #include "slang-ir-lower-bindless-resources.h"
 
 #include "slang-ir-insts.h"
+#include "slang-ir-inline.h"
 #include "slang-ir-util.h"
 #include "slang-ir-layout.h"
 #include "slang-ir-lower-buffer-element-type.h"
@@ -19,9 +20,6 @@ struct BindlessResourceLoweringContext
     TargetProgram* targetProgram;
     List<BindlessConvertedResource>* outConvertedResources;
 
-    // The index buffer SSBO (created once, shared by all)
-    IRGlobalParam* indexBuffer = nullptr;
-
     // Resource heap arrays for each (bindingIndex, elementType) pair
     // We use a combined key: bindingIndex * 65536 + type pointer hash
     Dictionary<uint64_t, IRGlobalParam*> resourceHeaps;
@@ -34,6 +32,231 @@ struct BindlessResourceLoweringContext
         IRArrayTypeBase* unsizedArrayType;
     };
     Dictionary<IRType*, LoweredStructuredBufferTypeInfo> loweredStructuredBufferTypes;
+
+    struct ResourceToConvert
+    {
+        IRGlobalParam* param = nullptr;
+        IRType* resourceType = nullptr;
+        int index = -1;
+        bool isArrayResource = false;
+    };
+
+    IRType* unwrapArrayType(IRType* type)
+    {
+        while (auto arrayType = as<IRArrayTypeBase>(type))
+            type = arrayType->getElementType();
+        return type;
+    }
+
+    bool isInsideFunction(IRInst* inst)
+    {
+        auto parent = inst ? inst->getParent() : nullptr;
+        while (parent)
+        {
+            if (as<IRBlock>(parent))
+                return true;
+            parent = parent->getParent();
+        }
+        return false;
+    }
+
+    bool getDirectArrayResourceInfo(IRType* type, IRType** outElementType, int* outShaderArrayLength)
+    {
+        auto arrayType = as<IRArrayTypeBase>(type);
+        if (!arrayType)
+            return false;
+
+        auto elementType = arrayType->getElementType();
+        if (!isResourceType(elementType) || as<IRArrayTypeBase>(elementType))
+            return false;
+
+        int shaderArrayLength = -1;
+        if (auto sizedArrayType = as<IRArrayType>(arrayType))
+        {
+            if (auto elementCount = as<IRIntLit>(sizedArrayType->getElementCount()))
+                shaderArrayLength = (int)elementCount->getValue();
+        }
+
+        if (outElementType)
+            *outElementType = elementType;
+        if (outShaderArrayLength)
+            *outShaderArrayLength = shaderArrayLength;
+        return true;
+    }
+
+    bool isCombinedTextureType(IRType* type)
+    {
+        if (auto textureType = as<IRTextureType>(type))
+            return textureType->isCombined();
+        return false;
+    }
+
+    IRType* getUncombinedTextureType(IRBuilder& builder, IRType* type)
+    {
+        auto textureType = as<IRTextureType>(type);
+        if (!textureType || !textureType->isCombined())
+            return type;
+
+        return builder.getTextureType(
+            textureType->getElementType(),
+            textureType->getShapeInst(),
+            textureType->getIsArrayInst(),
+            textureType->getIsMultisampleInst(),
+            textureType->getSampleCountInst(),
+            textureType->getAccessInst(),
+            textureType->getIsShadowInst(),
+            builder.getIntValue(builder.getIntType(), 0),
+            textureType->getFormatInst());
+    }
+
+    bool canRewriteCombinedResourceUses(IRGlobalParam* param)
+    {
+        for (auto use = param->firstUse; use; use = use->nextUse)
+        {
+            auto user = use->getUser();
+            if (as<IRStructFieldLayoutAttr>(user) || as<IRDecoration>(user))
+                continue;
+            if (!isInsideFunction(user))
+                continue;
+
+            switch (user->getOp())
+            {
+            case kIROp_CombinedTextureSamplerGetTexture:
+            case kIROp_CombinedTextureSamplerGetSampler:
+            case kIROp_Sample:
+            case kIROp_SampleGrad:
+            case kIROp_Call:
+            case kIROp_SPIRVAsmOperandInst:
+                break;
+            default:
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool canRewriteCombinedArrayResourceUses(IRGlobalParam* param)
+    {
+        for (auto use = param->firstUse; use; use = use->nextUse)
+        {
+            auto user = use->getUser();
+            if (as<IRStructFieldLayoutAttr>(user) || as<IRDecoration>(user))
+                continue;
+            if (!isInsideFunction(user))
+                continue;
+
+            auto getElementInst = as<IRGetElement>(user);
+            if (!getElementInst || getElementInst->getOperand(0) != param)
+                return false;
+
+            for (auto elementUse = getElementInst->firstUse; elementUse; elementUse = elementUse->nextUse)
+            {
+                auto elementUser = elementUse->getUser();
+                if (as<IRStructFieldLayoutAttr>(elementUser) || as<IRDecoration>(elementUser))
+                    continue;
+                if (!isInsideFunction(elementUser))
+                    continue;
+
+                switch (elementUser->getOp())
+                {
+                case kIROp_CombinedTextureSamplerGetTexture:
+                case kIROp_CombinedTextureSamplerGetSampler:
+                case kIROp_Sample:
+                case kIROp_SampleGrad:
+                case kIROp_Call:
+                case kIROp_SPIRVAsmOperandInst:
+                    break;
+                default:
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool tryInlineCombinedScalarResourceCallUses(IRGlobalParam* param)
+    {
+        bool changed = false;
+        bool progress = false;
+        do
+        {
+            progress = false;
+
+            List<IRUse*> uses;
+            for (auto use = param->firstUse; use; use = use->nextUse)
+                uses.add(use);
+
+            for (auto use : uses)
+            {
+                auto user = use->getUser();
+                if (as<IRStructFieldLayoutAttr>(user) || as<IRDecoration>(user))
+                    continue;
+                if (!isInsideFunction(user))
+                    continue;
+                if (auto call = as<IRCall>(user))
+                {
+                    if (inlineCall(call))
+                    {
+                        changed = true;
+                        progress = true;
+                        break;
+                    }
+                }
+            }
+        } while (progress);
+
+        return changed;
+    }
+
+    bool tryInlineCombinedArrayResourceCallUses(IRGlobalParam* param)
+    {
+        bool changed = false;
+        bool progress = false;
+        do
+        {
+            progress = false;
+
+            List<IRUse*> paramUses;
+            for (auto use = param->firstUse; use; use = use->nextUse)
+                paramUses.add(use);
+
+            for (auto paramUse : paramUses)
+            {
+                auto getElementInst = as<IRGetElement>(paramUse->getUser());
+                if (!getElementInst || getElementInst->getOperand(0) != param)
+                    continue;
+                if (!isInsideFunction(getElementInst))
+                    continue;
+
+                List<IRUse*> elementUses;
+                for (auto elementUse = getElementInst->firstUse; elementUse; elementUse = elementUse->nextUse)
+                    elementUses.add(elementUse);
+
+                for (auto elementUse : elementUses)
+                {
+                    auto elementUser = elementUse->getUser();
+                    if (as<IRStructFieldLayoutAttr>(elementUser) || as<IRDecoration>(elementUser))
+                        continue;
+                    if (!isInsideFunction(elementUser))
+                        continue;
+                    if (auto call = as<IRCall>(elementUser))
+                    {
+                        if (inlineCall(call))
+                        {
+                            changed = true;
+                            progress = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (progress)
+                    break;
+            }
+        } while (progress);
+
+        return changed;
+    }
 
     uint64_t makeResourceHeapKey(int bindingIndex, IRType* elementType)
     {
@@ -290,20 +513,68 @@ struct BindlessResourceLoweringContext
         return result;
     }
 
-    // Try to find a resource name in the index map.
+    void removeConflictingStructLayoutDecorations(IRStructType* elementStruct, IRTypeLayoutRules* layoutRules)
+    {
+        // Ensure the emitter sees layout data for the intended rule first.
+        List<IRDecoration*> decorationsToRemove;
+        for (auto decor : elementStruct->getDecorations())
+        {
+            if (auto sizeAlignDecor = as<IRSizeAndAlignmentDecoration>(decor))
+            {
+                if (sizeAlignDecor->getLayoutName() != layoutRules->ruleName)
+                    decorationsToRemove.add(decor);
+            }
+        }
+        for (auto decor : decorationsToRemove)
+            decor->removeAndDeallocate();
+
+        for (auto field : elementStruct->getFields())
+        {
+            List<IRDecoration*> fieldDecorsToRemove;
+            for (auto decor : field->getDecorations())
+            {
+                if (auto offsetDecor = as<IROffsetDecoration>(decor))
+                {
+                    if (offsetDecor->getLayoutName() != layoutRules->ruleName)
+                        fieldDecorsToRemove.add(decor);
+                }
+            }
+            for (auto decor : fieldDecorsToRemove)
+                decor->removeAndDeallocate();
+        }
+    }
+
+    void ensureUniformBufferElementLayoutForSPIRVBlock(IRType* bufferType, IRType* elementType)
+    {
+        auto elementStruct = as<IRStructType>(elementType);
+        if (!elementStruct)
+            return;
+
+        IRBuilder moduleBuilder(module);
+        moduleBuilder.setInsertInto(module->getModuleInst());
+
+        auto layoutRules = getTypeLayoutRuleForBuffer(targetProgram, bufferType);
+        removeConflictingStructLayoutDecorations(elementStruct, layoutRules);
+
+        IRSizeAndAlignment elementSize;
+        getSizeAndAlignment(targetProgram->getTargetReq(), layoutRules, elementType, &elementSize);
+
+        moduleBuilder.addPhysicalTypeDecoration(elementStruct);
+        moduleBuilder.addDecorationIfNotExist(elementStruct, kIROp_SPIRVBlockDecoration);
+    }
+
+    // Try to find a scalar resource name in the index map.
     // First tries exact match, then tries suffix match for hoisted struct members.
-    // Type legalization hoists struct members using "." as separator (e.g., "structVar.field").
-    // Returns -1 if not found.
     int findIndexForName(const String& name, const Dictionary<String, int>& indexMap)
     {
-        // Try exact match first
         if (auto* index = indexMap.tryGetValue(name))
             return *index;
 
-        // Try suffix match for hoisted struct members
-        // Type legalization uses "." as separator (e.g., "structVar.field" matches key "field")
         for (const auto& [key, value] : indexMap)
         {
+            if (key.endsWith("[]"))
+                continue;
+
             String suffix = "." + key;
             if (name.endsWith(suffix))
                 return value;
@@ -312,24 +583,32 @@ struct BindlessResourceLoweringContext
         return -1;
     }
 
-    // Get the matching key name for a resource (for metadata output)
-    String findMatchingKeyName(const String& name, const Dictionary<String, int>& indexMap)
+    // Try to find an array resource name in the index map.
+    // Array keys are represented as "name[]".
+    int findArrayIndexForName(const String& name, const Dictionary<String, int>& indexMap)
     {
-        if (indexMap.containsKey(name))
-            return name;
+        String arrayName = name + "[]";
+        if (auto* index = indexMap.tryGetValue(arrayName))
+            return *index;
 
         for (const auto& [key, value] : indexMap)
         {
-            String suffix = "." + key;
+            if (!key.endsWith("[]"))
+                continue;
+
+            String baseKey = key.subString(0, key.getLength() - 2);
+            String suffix = "." + baseKey;
             if (name.endsWith(suffix))
-                return key;
+                return value;
         }
-        return name;
+
+        return -1;
     }
 
-    // Map IR type to BindlessResourceType enum for the resolver callback
+    // Map IR type to BindlessResourceType enum for resolver callbacks.
     BindlessResourceType getBindlessResourceTypeForIRType(IRType* type)
     {
+        type = unwrapArrayType(type);
         switch (type->getOp())
         {
         case kIROp_SamplerStateType:
@@ -340,7 +619,7 @@ struct BindlessResourceLoweringContext
         {
             auto textureType = as<IRTextureType>(type);
             if (textureType && textureType->isCombined())
-                return BindlessResourceType::CombinedTextureSampler;
+                return BindlessResourceType::SampledImage;
             if (textureType && textureType->getAccess() == SLANG_RESOURCE_ACCESS_READ_WRITE)
                 return BindlessResourceType::StorageImage;
             return BindlessResourceType::SampledImage;
@@ -368,25 +647,22 @@ struct BindlessResourceLoweringContext
     // Determine the access mode for a resource type
     ::SlangResourceAccess getResourceAccess(IRType* type)
     {
+        type = unwrapArrayType(type);
         switch (type->getOp())
         {
-        // Read-write buffer types
         case kIROp_HLSLRWStructuredBufferType:
         case kIROp_HLSLRWByteAddressBufferType:
             return SLANG_RESOURCE_ACCESS_READ_WRITE;
 
-        // Rasterizer ordered types
         case kIROp_HLSLRasterizerOrderedStructuredBufferType:
         case kIROp_HLSLRasterizerOrderedByteAddressBufferType:
             return SLANG_RESOURCE_ACCESS_RASTER_ORDERED;
 
-        // Append/consume types
         case kIROp_HLSLAppendStructuredBufferType:
             return SLANG_RESOURCE_ACCESS_APPEND;
         case kIROp_HLSLConsumeStructuredBufferType:
             return SLANG_RESOURCE_ACCESS_CONSUME;
 
-        // Textures need access check
         case kIROp_TextureType:
         {
             auto textureType = as<IRTextureType>(type);
@@ -395,7 +671,6 @@ struct BindlessResourceLoweringContext
             return SLANG_RESOURCE_ACCESS_READ;
         }
 
-        // Read-only types (StructuredBuffer, ByteAddressBuffer, ConstantBuffer, samplers, etc.)
         default:
             return SLANG_RESOURCE_ACCESS_READ;
         }
@@ -410,35 +685,28 @@ struct BindlessResourceLoweringContext
     }
 
     // Get the binding index for a resource type (VkMutable bindings)
-    // Binding 0: Samplers
-    // Binding 1: Combined Texture Samplers
-    // Binding 2: Textures (read-only, SampledImage)
-    // Binding 3: RWTextures (read-write, StorageImage)
-    // Binding 4: UBOs (ConstantBuffer)
-    // Binding 5: SSBOs (StructuredBuffer, ByteAddressBuffer, etc.)
     int getBindingIndexForResourceType(IRType* type)
     {
+        type = unwrapArrayType(type);
         switch (type->getOp())
         {
         case kIROp_SamplerStateType:
         case kIROp_SamplerComparisonStateType:
-            return 0; // Sampler binding
+            return 0;
 
         case kIROp_TextureType:
         {
-            // Check if this is a combined texture sampler
             auto textureType = as<IRTextureType>(type);
             if (textureType && textureType->isCombined())
-                return 1; // CombinedTextureSampler binding
-            // Check access mode for read-only vs read-write
+                return 2;
             if (textureType && textureType->getAccess() == SLANG_RESOURCE_ACCESS_READ_WRITE)
-                return 3; // RWTexture (StorageImage) binding
-            return 2; // Texture (SampledImage) binding
+                return 3;
+            return 2;
         }
 
         case kIROp_ConstantBufferType:
         case kIROp_ParameterBlockType:
-            return 4; // UBO binding
+            return 4;
 
         case kIROp_HLSLStructuredBufferType:
         case kIROp_HLSLRWStructuredBufferType:
@@ -448,14 +716,13 @@ struct BindlessResourceLoweringContext
         case kIROp_HLSLConsumeStructuredBufferType:
         case kIROp_HLSLRasterizerOrderedStructuredBufferType:
         case kIROp_HLSLRasterizerOrderedByteAddressBufferType:
-            return 5; // SSBO binding
+            return 5;
 
         default:
-            return 5; // Other buffer types default to SSBO
+            return 5;
         }
     }
 
-    // Resolve a bindless index for a resource, using cache and callback if available
     int resolveBindlessIndex(const String& name, IRType* resourceType)
     {
         auto& indexMap = targetProgram->m_bindlessResourceIndexMap;
@@ -463,19 +730,14 @@ struct BindlessResourceLoweringContext
         auto cache = targetProgram->m_bindlessResolverCache;
         auto userData = targetProgram->m_bindlessResolverUserData;
 
-        // 1. First check static index map (exact or suffix match)
         int staticIndex = findIndexForName(name, indexMap);
         if (staticIndex >= 0)
             return staticIndex;
 
-        // 2. If no resolver callback, resource is not mapped
         if (!resolver)
             return -1;
 
-        // 3. Get the resource type for the callback
         BindlessResourceType bindlessType = getBindlessResourceTypeForIRType(resourceType);
-
-        // 4. Check the cache
         String cacheKey = makeCacheKey(name, bindlessType);
         if (cache)
         {
@@ -483,58 +745,181 @@ struct BindlessResourceLoweringContext
                 return *cachedIndex;
         }
 
-        // 5. Call the resolver callback (convert enum class to C enum for public API)
-        slang::SlangBindlessResourceType publicType = static_cast<slang::SlangBindlessResourceType>(bindlessType);
+        slang::SlangBindlessResourceType publicType =
+            static_cast<slang::SlangBindlessResourceType>(bindlessType);
         int resolvedIndex = resolver(name.getBuffer(), publicType, userData);
-
-        // 6. Cache the result (even if -1, to avoid repeated calls)
         if (cache && resolvedIndex >= 0)
-        {
             cache->add(cacheKey, resolvedIndex);
+        return resolvedIndex;
+    }
+
+    bool hasScalarBindingForArrayName(const String& name, IRType* resourceType)
+    {
+        return resolveBindlessIndex(name, resourceType) >= 0;
+    }
+
+    int resolveBindlessArrayBaseIndex(
+        const String& name,
+        IRType* resourceType,
+        int shaderArrayLength,
+        int* outResolvedArrayLength)
+    {
+        if (outResolvedArrayLength)
+            *outResolvedArrayLength = -1;
+
+        auto& indexMap = targetProgram->m_bindlessResourceIndexMap;
+        int staticIndex = findArrayIndexForName(name, indexMap);
+        if (staticIndex >= 0)
+        {
+            if (outResolvedArrayLength)
+                *outResolvedArrayLength = shaderArrayLength;
+            return staticIndex;
         }
 
-        return resolvedIndex;
+        auto resolver = targetProgram->m_bindlessArrayResolver;
+        auto userData = targetProgram->m_bindlessArrayResolverUserData;
+        if (!resolver)
+            return -1;
+
+        BindlessResourceType bindlessType = getBindlessResourceTypeForIRType(resourceType);
+        slang::SlangBindlessResourceType publicType =
+            static_cast<slang::SlangBindlessResourceType>(bindlessType);
+        int resolvedArrayLength = -1;
+        int baseIndex =
+            resolver(name.getBuffer(), publicType, shaderArrayLength, &resolvedArrayLength, userData);
+        if (outResolvedArrayLength)
+            *outResolvedArrayLength = resolvedArrayLength;
+        return baseIndex;
+    }
+
+    int resolveCombinedSamplerIndex(const String& name)
+    {
+        auto resolver = targetProgram->m_bindlessCombinedSamplerResolver;
+        auto userData = targetProgram->m_bindlessCombinedSamplerResolverUserData;
+        if (!resolver)
+            return 0;
+
+        int resolvedIndex = resolver(name.getBuffer(), userData);
+        return resolvedIndex >= 0 ? resolvedIndex : 0;
     }
 
     void processModule()
     {
-        // Check if we have any bindless configuration
         auto& indexMap = targetProgram->m_bindlessResourceIndexMap;
         auto resolver = targetProgram->m_bindlessResolver;
-        if (indexMap.getCount() == 0 && !resolver)
-            return; // Nothing to do
+        auto arrayResolver = targetProgram->m_bindlessArrayResolver;
+        if (indexMap.getCount() == 0 && !resolver && !arrayResolver)
+            return;
 
-        // Find global resources to convert (after DCE, so only used resources remain)
-        List<IRGlobalParam*> resourcesToConvert;
+        List<ResourceToConvert> resourcesToConvert;
         List<IRGlobalParam*> unmappedResources;
+        List<IRGlobalParam*> arrayResourcesWithScalarConflict;
 
         for (auto inst : module->getGlobalInsts())
         {
             auto globalParam = as<IRGlobalParam>(inst);
             if (!globalParam)
                 continue;
+            if (globalParam->findDecoration<IRHasExplicitVulkanBindingDecoration>())
+                continue;
 
-            // Check if it's a resource type
             auto paramType = globalParam->getDataType();
-            if (!isResourceType(paramType))
+            if (!isResourceType(paramType) || !globalParam->hasUses())
                 continue;
 
-            // Check if it has uses (actively used after DCE)
-            if (!globalParam->hasUses())
-                continue;
-
-            // Get name from decoration
             auto nameHint = globalParam->findDecoration<IRNameHintDecoration>();
             if (!nameHint)
                 continue;
 
             String name = nameHint->getName();
 
-            // Try to resolve an index for this resource
+            IRType* arrayElementType = nullptr;
+            int shaderArrayLength = -1;
+            if (getDirectArrayResourceInfo(paramType, &arrayElementType, &shaderArrayLength))
+            {
+                int resolvedArrayLength = -1;
+                int baseIndex = resolveBindlessArrayBaseIndex(
+                    name,
+                    arrayElementType,
+                    shaderArrayLength,
+                    &resolvedArrayLength);
+
+                if (baseIndex >= 0)
+                {
+                    if (isCombinedTextureType(arrayElementType) &&
+                        isSPIRV(targetProgram->getTargetReq()->getTarget()))
+                    {
+                        tryInlineCombinedArrayResourceCallUses(globalParam);
+                    }
+
+                    if (isCombinedTextureType(arrayElementType) &&
+                        !canRewriteCombinedArrayResourceUses(globalParam))
+                    {
+                        continue;
+                    }
+
+                    if (shaderArrayLength >= 0 &&
+                        resolvedArrayLength >= 0 &&
+                        shaderArrayLength != resolvedArrayLength)
+                    {
+                        if (sink)
+                        {
+                            sink->diagnose(
+                                globalParam->sourceLoc,
+                                Diagnostics::bindlessArrayLengthMismatch,
+                                name,
+                                resolvedArrayLength,
+                                shaderArrayLength);
+                        }
+                        continue;
+                    }
+
+                    ResourceToConvert info;
+                    info.param = globalParam;
+                    info.resourceType = arrayElementType;
+                    info.index = baseIndex;
+                    info.isArrayResource = true;
+                    resourcesToConvert.add(info);
+                }
+                else
+                {
+                    if (hasScalarBindingForArrayName(name, arrayElementType))
+                        arrayResourcesWithScalarConflict.add(globalParam);
+                    else
+                        unmappedResources.add(globalParam);
+                }
+                continue;
+            }
+
+            // Only direct arrays of resource objects are lowered through the array resolver path.
+            // More complex array nesting is currently left unmapped.
+            if (as<IRArrayTypeBase>(paramType))
+            {
+                unmappedResources.add(globalParam);
+                continue;
+            }
+
             int index = resolveBindlessIndex(name, paramType);
             if (index >= 0)
             {
-                resourcesToConvert.add(globalParam);
+                if (isCombinedTextureType(paramType) &&
+                    isSPIRV(targetProgram->getTargetReq()->getTarget()))
+                {
+                    tryInlineCombinedScalarResourceCallUses(globalParam);
+                }
+
+                if (isCombinedTextureType(paramType) && !canRewriteCombinedResourceUses(globalParam))
+                {
+                    // Leave this resource unchanged if it has unsupported combined-type use patterns.
+                    continue;
+                }
+
+                ResourceToConvert info;
+                info.param = globalParam;
+                info.resourceType = paramType;
+                info.index = index;
+                info.isArrayResource = false;
+                resourcesToConvert.add(info);
             }
             else
             {
@@ -542,7 +927,6 @@ struct BindlessResourceLoweringContext
             }
         }
 
-        // Emit warnings for unmapped resources (only if we have any bindless config)
         for (auto param : unmappedResources)
         {
             auto nameHint = param->findDecoration<IRNameHintDecoration>();
@@ -555,239 +939,303 @@ struct BindlessResourceLoweringContext
             }
         }
 
-        // If no resources to convert, we're done
+        for (auto param : arrayResourcesWithScalarConflict)
+        {
+            auto nameHint = param->findDecoration<IRNameHintDecoration>();
+            if (nameHint && sink)
+            {
+                sink->diagnose(
+                    param->sourceLoc,
+                    Diagnostics::arrayResourceConflictsWithScalarBindlessBinding,
+                    nameHint->getName());
+            }
+        }
+
         if (resourcesToConvert.getCount() == 0)
             return;
 
-        // Create the index buffer SSBO at set 1, binding 3
-        createIndexBuffer();
-
-        // Convert each resource
-        for (auto globalParam : resourcesToConvert)
+        for (const auto& resource : resourcesToConvert)
         {
-            convertResourceWithResolver(globalParam);
+            if (resource.isArrayResource)
+                convertArrayResourceWithResolver(resource.param, resource.resourceType, resource.index);
+            else
+                convertResourceWithResolver(resource.param, resource.resourceType, resource.index);
         }
     }
 
-    void createIndexBuffer()
+    IRInst* stripNonUniformIndexWrappers(IRInst* userIndex, bool& hasNonUniform)
     {
-        IRBuilder builder(module);
-        builder.setInsertInto(module->getModuleInst());
-
-        // Type: StructuredBuffer<uint>
-        auto uintType = builder.getBasicType(BaseType::UInt);
-        auto structuredBufferType = builder.getType(kIROp_HLSLStructuredBufferType, uintType);
-
-        indexBuffer = builder.createGlobalParam(structuredBufferType);
-        builder.addNameHintDecoration(indexBuffer, toSlice("__slang_bindless_indices"));
-
-        // Create layout: set 1, binding 3
-        auto varLayout = createIndexBufferLayout(builder);
-        builder.addLayoutDecoration(indexBuffer, varLayout);
-    }
-
-    IRVarLayout* createIndexBufferLayout(IRBuilder& builder)
-    {
-        // Create type layout indicating this uses a descriptor table slot
-        IRTypeLayout::Builder typeLayoutBuilder(&builder);
-        typeLayoutBuilder.addResourceUsage(LayoutResourceKind::DescriptorTableSlot, LayoutSize(1));
-        auto typeLayout = typeLayoutBuilder.build();
-
-        // Create var layout with set 0, binding 6
-        IRVarLayout::Builder varLayoutBuilder(&builder, typeLayout);
-        varLayoutBuilder.findOrAddResourceInfo(LayoutResourceKind::RegisterSpace)->offset = 0;
-        varLayoutBuilder.findOrAddResourceInfo(LayoutResourceKind::DescriptorTableSlot)->offset = 6;
-        return varLayoutBuilder.build();
-    }
-
-    void convertResourceWithResolver(IRGlobalParam* param)
-    {
-        auto nameHint = param->findDecoration<IRNameHintDecoration>();
-        String name = nameHint->getName();
-        auto resourceType = param->getDataType();
-
-        // Resolve the index (will use cache if already resolved)
-        int index = resolveBindlessIndex(name, resourceType);
-
-        IRBuilder builder(module);
-
-        // We need to create a replacement value that can be used wherever the
-        // global param was used. Since global params are used directly (not loaded from),
-        // we need to create a global that computes the value.
-        //
-        // Strategy: For each use of the global param, replace it with the
-        // dereferenced descriptor handle.
-
-        // Collect all uses first (since we'll be modifying them)
-        List<IRUse*> uses;
-        for (auto use = param->firstUse; use; use = use->nextUse)
+        hasNonUniform = false;
+        while (userIndex->getOp() == kIROp_NonUniformResourceIndex)
         {
-            uses.add(use);
+            hasNonUniform = true;
+            userIndex = userIndex->getOperand(0);
+        }
+        return userIndex;
+    }
+
+    void removeDeadNonUniformIndexWrappers(IRInst* userIndex)
+    {
+        while (userIndex && userIndex->getOp() == kIROp_NonUniformResourceIndex)
+        {
+            auto next = userIndex->getOperand(0);
+            if (userIndex->hasUses())
+                break;
+            userIndex->removeAndDeallocate();
+            userIndex = next;
+        }
+    }
+
+    IRInst* buildArrayedDescriptorIndex(IRBuilder& builder, int baseIndex, IRInst* userIndex)
+    {
+
+        IRType* indexType = userIndex->getDataType();
+        auto basicType = as<IRBasicType>(indexType);
+        if (!basicType || (basicType->getBaseType() != BaseType::Int && basicType->getBaseType() != BaseType::UInt))
+        {
+            indexType = builder.getBasicType(BaseType::Int);
+            userIndex = builder.emitCast(indexType, userIndex);
         }
 
-        // For each use, insert the lookup and cast instructions before the user
-        for (auto use : uses)
+        auto baseLiteral = builder.getIntValue(indexType, baseIndex);
+        return builder.emitAdd(indexType, baseLiteral, userIndex);
+    }
+
+    void rewriteResourceUseWithHeapIndex(
+        IRBuilder& builder,
+        const String& resourceName,
+        IRType* resourceType,
+        IRUse* use,
+        IRInst* heapIndex,
+        bool nonUniformHeapIndex = false)
+    {
+        auto user = use->getUser();
+        auto combinedTextureType = as<IRTextureType>(resourceType);
+        bool isCombinedTextureResource = combinedTextureType && combinedTextureType->isCombined();
+        IRType* bindlessLookupType = resourceType;
+        if (isCombinedTextureResource)
+            bindlessLookupType = getUncombinedTextureType(builder, resourceType);
+
+        int bindingIndex = getBindingIndexForResourceType(bindlessLookupType);
+        bool useSPIRVNonUniformDecoration =
+            isSPIRV(targetProgram->getTargetReq()->getTarget());
+
+        auto cbufferType = as<IRConstantBufferType>(bindlessLookupType);
+        auto paramBlockType = as<IRParameterBlockType>(bindlessLookupType);
+        auto structuredBufferType = as<IRHLSLStructuredBufferTypeBase>(bindlessLookupType);
+
+        IRType* heapElementType = bindlessLookupType;
+        bool isUniformBuffer = false;
+        bool isStructuredBuffer = false;
+        LoweredStructuredBufferTypeInfo sbInfo = {};
+
+        if (cbufferType || paramBlockType)
         {
-            auto user = use->getUser();
+            heapElementType = as<IRUniformParameterGroupType>(resourceType)->getElementType();
+            isUniformBuffer = true;
+            ensureUniformBufferElementLayoutForSPIRVBlock(resourceType, heapElementType);
+        }
+        else if (structuredBufferType)
+        {
+            sbInfo = getOrCreateStructuredBufferWrapperType(structuredBufferType);
+            heapElementType = sbInfo.wrapperStructType;
+            isStructuredBuffer = true;
+        }
 
-            // Skip uses in layout attributes and decorations - they shouldn't be replaced
-            // with actual resource loads
-            if (as<IRStructFieldLayoutAttr>(user))
-                continue;
-            if (as<IRDecoration>(user))
-                continue;
+        IRInst* resourceHeap = getOrCreateResourceHeap(bindingIndex, heapElementType);
 
-            // Only process uses that are inside functions (i.e., have an IRBlock ancestor)
-            auto parent = user->getParent();
-            bool isInsideFunction = false;
-            while (parent)
+        if (isCombinedTextureResource)
+        {
+            auto samplerType = getIntVal(combinedTextureType->getIsShadowInst()) != 0
+                                   ? builder.getType(kIROp_SamplerComparisonStateType)
+                                   : builder.getType(kIROp_SamplerStateType);
+            int fixedSamplerIndex = resolveCombinedSamplerIndex(resourceName);
+            auto target = targetProgram->getTargetReq()->getTarget();
+            bool useSamplerHeapIntrinsic = !(
+                target == CodeGenTarget::SPIRV || target == CodeGenTarget::SPIRVAssembly ||
+                target == CodeGenTarget::GLSL);
+
+            switch (user->getOp())
             {
-                if (as<IRBlock>(parent))
+            case kIROp_Call:
+            case kIROp_SPIRVAsmOperandInst:
                 {
-                    isInsideFunction = true;
-                    break;
+                    if (!useSamplerHeapIntrinsic)
+                    {
+                        // Ensure a sampler heap global exists for emitter-side reconstruction.
+                        auto samplerHeap = getOrCreateResourceHeap(0, samplerType);
+                        builder.addKeepAliveDecoration(samplerHeap);
+                    }
+
+                    auto uintType = builder.getUIntType();
+                    IRInst* textureIndex = heapIndex;
+                    if (textureIndex->getDataType() != uintType)
+                        textureIndex = builder.emitCast(uintType, textureIndex);
+                    if (nonUniformHeapIndex && !useSPIRVNonUniformDecoration)
+                        textureIndex = builder.emitNonUniformResourceIndexInst(textureIndex);
+
+                    auto samplerIndex = builder.getIntValue(uintType, fixedSamplerIndex);
+                    auto uint2Type = builder.getVectorType(uintType, 2);
+                    IRInst* handleComps[2] = {textureIndex, samplerIndex};
+                    auto packedHandle = builder.emitMakeVector(uint2Type, 2, handleComps);
+                    IRInst* combinedVal = builder.emitIntrinsicInst(
+                        resourceType,
+                        kIROp_MakeCombinedTextureSamplerFromHandle,
+                        1,
+                        &packedHandle);
+                    if (nonUniformHeapIndex && useSPIRVNonUniformDecoration)
+                        builder.addSPIRVNonUniformResourceDecoration(combinedVal);
+                    builder.replaceOperand(use, combinedVal);
+                    return;
                 }
-                parent = parent->getParent();
-            }
-            if (!isInsideFunction)
-                continue;
-
-            builder.setInsertBefore(user);
-
-            // 1. Load index buffer element: indexBuffer[STATIC_INDEX]
-            auto indexLiteral = builder.getIntValue(builder.getBasicType(BaseType::Int), index);
-            auto uintType = builder.getBasicType(BaseType::UInt);
-            IRInst* loadArgs[] = { indexBuffer, indexLiteral };
-            auto heapIndex = builder.emitIntrinsicInst(uintType, kIROp_StructuredBufferLoad, 2, loadArgs);
-
-            // Get binding index based on resource type (VkMutable bindings)
-            int bindingIndex = getBindingIndexForResourceType(resourceType);
-
-            // Determine how to handle this resource type
-            auto cbufferType = as<IRConstantBufferType>(resourceType);
-            auto paramBlockType = as<IRParameterBlockType>(resourceType);
-            auto structuredBufferType = as<IRHLSLStructuredBufferTypeBase>(resourceType);
-
-            IRType* heapElementType = resourceType;
-            bool isUniformBuffer = false;
-            bool isStructuredBuffer = false;
-            LoweredStructuredBufferTypeInfo sbInfo = {};
-
-            if (cbufferType || paramBlockType)
-            {
-                // For ConstantBuffer<T> and ParameterBlock<T>:
-                // Create a heap of the inner element type T
-                heapElementType = as<IRUniformParameterGroupType>(resourceType)->getElementType();
-                isUniformBuffer = true;
-            }
-            else if (structuredBufferType)
-            {
-                // For StructuredBuffer<T> and RWStructuredBuffer<T>:
-                // Create a wrapper struct containing T[] and use that as the heap element type
-                sbInfo = getOrCreateStructuredBufferWrapperType(structuredBufferType);
-                heapElementType = sbInfo.wrapperStructType;
-                isStructuredBuffer = true;
+            case kIROp_CombinedTextureSamplerGetTexture:
+            case kIROp_CombinedTextureSamplerGetSampler:
+            case kIROp_Sample:
+            case kIROp_SampleGrad:
+                break;
+            default:
+                return;
             }
 
-            // Get or create the resource heap at module scope
-            auto resourceHeap = getOrCreateResourceHeap(bindingIndex, heapElementType);
-
-            // For SPIRV, unbounded arrays need pointer-based access:
-            // 1. Get a pointer to the element (OpAccessChain)
-            // 2. Handle based on resource type
+            if (nonUniformHeapIndex && !useSPIRVNonUniformDecoration)
+                heapIndex = builder.emitNonUniformResourceIndexInst(heapIndex);
             auto elementPtr = builder.emitElementAddress(resourceHeap, heapIndex);
+            if (nonUniformHeapIndex && useSPIRVNonUniformDecoration)
+                builder.addSPIRVNonUniformResourceDecoration(elementPtr);
 
-            if (isStructuredBuffer)
+            auto textureVal = builder.emitLoad(bindlessLookupType, elementPtr);
+            if (nonUniformHeapIndex && useSPIRVNonUniformDecoration)
+                builder.addSPIRVNonUniformResourceDecoration(textureVal);
+
+            auto samplerIndexLiteral =
+                builder.getIntValue(builder.getBasicType(BaseType::Int), fixedSamplerIndex);
+            IRInst* samplerVal = nullptr;
+            if (useSamplerHeapIntrinsic)
             {
-                // For structured buffers, we need to transform the operation that uses this buffer.
-                // The user of the global param should be a StructuredBufferLoad/Store/GetElementPtr
-                auto userOp = user->getOp();
-
-                if (userOp == kIROp_StructuredBufferLoad ||
-                    userOp == kIROp_RWStructuredBufferLoad ||
-                    userOp == kIROp_StructuredBufferLoadStatus ||
-                    userOp == kIROp_RWStructuredBufferLoadStatus)
-                {
-                    // StructuredBufferLoad(buffer, index) -> Load(FieldAddress(ElementAddress(heap, heapIdx), arrayKey)[index])
-                    auto loadIndex = user->getOperand(1);
-
-                    // Get pointer to the _data array field in the wrapper struct
-                    auto arrayFieldPtr = builder.emitFieldAddress(
-                        builder.getPtrType(sbInfo.unsizedArrayType, AddressSpace::StorageBuffer),
-                        elementPtr,
-                        sbInfo.arrayKey);
-
-                    // Get pointer to element at loadIndex
-                    auto elementAddr = builder.emitElementAddress(arrayFieldPtr, loadIndex);
-
-                    // Load the element
-                    auto loadedValue = builder.emitLoad(structuredBufferType->getElementType(), elementAddr);
-
-                    // Replace the entire StructuredBufferLoad instruction
-                    user->replaceUsesWith(loadedValue);
-                    user->removeAndDeallocate();
-                }
-                else if (userOp == kIROp_RWStructuredBufferStore)
-                {
-                    // RWStructuredBufferStore(buffer, index, value) -> Store(ptr, value)
-                    auto storeIndex = user->getOperand(1);
-                    auto storeValue = user->getOperand(2);
-
-                    // Get pointer to the _data array field
-                    auto arrayFieldPtr = builder.emitFieldAddress(
-                        builder.getPtrType(sbInfo.unsizedArrayType, AddressSpace::StorageBuffer),
-                        elementPtr,
-                        sbInfo.arrayKey);
-
-                    // Get pointer to element at storeIndex
-                    auto elementAddr = builder.emitElementAddress(arrayFieldPtr, storeIndex);
-
-                    // Store the value
-                    builder.emitStore(elementAddr, storeValue);
-
-                    // Remove the original store instruction
-                    user->removeAndDeallocate();
-                }
-                else if (userOp == kIROp_RWStructuredBufferGetElementPtr)
-                {
-                    // RWStructuredBufferGetElementPtr(buffer, index) -> ElementAddress(FieldAddress(...), index)
-                    auto gepIndex = user->getOperand(1);
-
-                    // Get pointer to the _data array field
-                    auto arrayFieldPtr = builder.emitFieldAddress(
-                        builder.getPtrType(sbInfo.unsizedArrayType, AddressSpace::StorageBuffer),
-                        elementPtr,
-                        sbInfo.arrayKey);
-
-                    // Get pointer to element at gepIndex
-                    auto elementAddr = builder.emitElementAddress(arrayFieldPtr, gepIndex);
-
-                    // Replace the GetElementPtr instruction
-                    user->replaceUsesWith(elementAddr);
-                    user->removeAndDeallocate();
-                }
-                else
-                {
-                    // Other uses - just provide the element pointer and hope for the best
-                    // This might need adjustment for specific cases
-                    builder.replaceOperand(use, elementPtr);
-                }
-            }
-            else if (isUniformBuffer)
-            {
-                // For uniform buffers, the element pointer IS the replacement.
-                // The original ConstantBuffer<T> acts like a pointer to T.
-                builder.replaceOperand(use, elementPtr);
+                samplerVal = builder.emitIntrinsicInst(
+                    samplerType,
+                    kIROp_LoadSamplerDescriptorFromHeap,
+                    1,
+                    &samplerIndexLiteral);
             }
             else
             {
-                // For other resources (textures, samplers), load the value from the pointer
-                auto replacement = builder.emitLoad(resourceType, elementPtr);
-                builder.replaceOperand(use, replacement);
+                auto samplerHeap = getOrCreateResourceHeap(0, samplerType);
+                auto samplerPtr = builder.emitElementAddress(samplerHeap, samplerIndexLiteral);
+                samplerVal = builder.emitLoad(samplerType, samplerPtr);
+            }
+
+            switch (user->getOp())
+            {
+            case kIROp_CombinedTextureSamplerGetTexture:
+                user->replaceUsesWith(textureVal);
+                user->removeAndDeallocate();
+                return;
+            case kIROp_CombinedTextureSamplerGetSampler:
+                user->replaceUsesWith(samplerVal);
+                user->removeAndDeallocate();
+                return;
+            case kIROp_Sample:
+            case kIROp_SampleGrad:
+                if (use == user->getOperandUse(0))
+                    builder.replaceOperand(use, textureVal);
+                else if (use == user->getOperandUse(1))
+                    builder.replaceOperand(use, samplerVal);
+                return;
+            default:
+                return;
             }
         }
 
-        // Record for metadata output
+        if (nonUniformHeapIndex && !useSPIRVNonUniformDecoration)
+            heapIndex = builder.emitNonUniformResourceIndexInst(heapIndex);
+        auto elementPtr = builder.emitElementAddress(resourceHeap, heapIndex);
+        if (nonUniformHeapIndex && useSPIRVNonUniformDecoration)
+            builder.addSPIRVNonUniformResourceDecoration(elementPtr);
+
+        if (isStructuredBuffer)
+        {
+            auto userOp = user->getOp();
+
+            if (userOp == kIROp_StructuredBufferLoad ||
+                userOp == kIROp_RWStructuredBufferLoad ||
+                userOp == kIROp_StructuredBufferLoadStatus ||
+                userOp == kIROp_RWStructuredBufferLoadStatus)
+            {
+                auto loadIndex = user->getOperand(1);
+                auto arrayFieldPtr = builder.emitFieldAddress(
+                    builder.getPtrType(sbInfo.unsizedArrayType, AddressSpace::StorageBuffer),
+                    elementPtr,
+                    sbInfo.arrayKey);
+                auto elementAddr = builder.emitElementAddress(arrayFieldPtr, loadIndex);
+                auto loadedValue = builder.emitLoad(structuredBufferType->getElementType(), elementAddr);
+                user->replaceUsesWith(loadedValue);
+                user->removeAndDeallocate();
+            }
+            else if (userOp == kIROp_RWStructuredBufferStore)
+            {
+                auto storeIndex = user->getOperand(1);
+                auto storeValue = user->getOperand(2);
+                auto arrayFieldPtr = builder.emitFieldAddress(
+                    builder.getPtrType(sbInfo.unsizedArrayType, AddressSpace::StorageBuffer),
+                    elementPtr,
+                    sbInfo.arrayKey);
+                auto elementAddr = builder.emitElementAddress(arrayFieldPtr, storeIndex);
+                builder.emitStore(elementAddr, storeValue);
+                user->removeAndDeallocate();
+            }
+            else if (userOp == kIROp_RWStructuredBufferGetElementPtr)
+            {
+                auto gepIndex = user->getOperand(1);
+                auto arrayFieldPtr = builder.emitFieldAddress(
+                    builder.getPtrType(sbInfo.unsizedArrayType, AddressSpace::StorageBuffer),
+                    elementPtr,
+                    sbInfo.arrayKey);
+                auto elementAddr = builder.emitElementAddress(arrayFieldPtr, gepIndex);
+                user->replaceUsesWith(elementAddr);
+                user->removeAndDeallocate();
+            }
+            else
+            {
+                builder.replaceOperand(use, elementPtr);
+            }
+        }
+        else if (isUniformBuffer)
+        {
+            builder.replaceOperand(use, elementPtr);
+        }
+        else
+        {
+            auto replacement = builder.emitLoad(bindlessLookupType, elementPtr);
+            if (nonUniformHeapIndex && useSPIRVNonUniformDecoration)
+                builder.addSPIRVNonUniformResourceDecoration(replacement);
+            builder.replaceOperand(use, replacement);
+        }
+    }
+
+    void convertResourceWithResolver(IRGlobalParam* param, IRType* resourceType, int index)
+    {
+        auto nameHint = param->findDecoration<IRNameHintDecoration>();
+        String name = nameHint->getName();
+        IRBuilder builder(module);
+
+        List<IRUse*> uses;
+        for (auto use = param->firstUse; use; use = use->nextUse)
+            uses.add(use);
+
+        for (auto use : uses)
+        {
+            auto user = use->getUser();
+            if (as<IRStructFieldLayoutAttr>(user) || as<IRDecoration>(user))
+                continue;
+            if (!isInsideFunction(user))
+                continue;
+
+            builder.setInsertBefore(user);
+            auto indexLiteral = builder.getIntValue(builder.getBasicType(BaseType::Int), index);
+            rewriteResourceUseWithHeapIndex(builder, name, resourceType, use, indexLiteral);
+        }
+
         if (outConvertedResources)
         {
             BindlessConvertedResource info;
@@ -799,31 +1247,108 @@ struct BindlessResourceLoweringContext
             outConvertedResources->add(info);
         }
 
-        // Remove the original global param only if it has no remaining uses
-        // (some uses like layout attributes may have been skipped)
         if (!param->hasUses())
-        {
             param->removeAndDeallocate();
+    }
+
+    void convertArrayResourceWithResolver(IRGlobalParam* param, IRType* resourceType, int baseIndex)
+    {
+        auto nameHint = param->findDecoration<IRNameHintDecoration>();
+        String name = nameHint->getName();
+        IRBuilder builder(module);
+
+        List<IRUse*> paramUses;
+        for (auto use = param->firstUse; use; use = use->nextUse)
+            paramUses.add(use);
+
+        for (auto paramUse : paramUses)
+        {
+            auto getElementInst = as<IRGetElement>(paramUse->getUser());
+            if (!getElementInst || getElementInst->getOperand(0) != param)
+                continue;
+            if (!isInsideFunction(getElementInst))
+                continue;
+
+            auto originalUserIndex = getElementInst->getOperand(1);
+            bool hasNonUniformUserIndex = false;
+            auto userIndex = stripNonUniformIndexWrappers(
+                originalUserIndex,
+                hasNonUniformUserIndex);
+
+            List<IRUse*> elementUses;
+            for (auto use = getElementInst->firstUse; use; use = use->nextUse)
+                elementUses.add(use);
+
+            for (auto elementUse : elementUses)
+            {
+                auto elementUser = elementUse->getUser();
+                if (as<IRStructFieldLayoutAttr>(elementUser) || as<IRDecoration>(elementUser))
+                    continue;
+                if (!isInsideFunction(elementUser))
+                    continue;
+
+                builder.setInsertBefore(elementUser);
+                auto effectiveIndex = buildArrayedDescriptorIndex(builder, baseIndex, userIndex);
+                rewriteResourceUseWithHeapIndex(
+                    builder,
+                    name,
+                    resourceType,
+                    elementUse,
+                    effectiveIndex,
+                    hasNonUniformUserIndex);
+            }
+
+            if (!getElementInst->hasUses())
+                getElementInst->removeAndDeallocate();
+            removeDeadNonUniformIndexWrappers(originalUserIndex);
         }
+
+        if (outConvertedResources)
+        {
+            BindlessConvertedResource info;
+            info.name = name;
+            info.typeName = getResourceTypeName(param->getDataType());
+            info.index = baseIndex;
+            info.resourceType = getBindlessResourceTypeForIRType(resourceType);
+            info.access = getResourceAccess(resourceType);
+            outConvertedResources->add(info);
+        }
+
+        if (!param->hasUses())
+            param->removeAndDeallocate();
     }
 
     String getResourceTypeName(IRType* type)
     {
+        int arrayDepth = 0;
+        while (auto arrayType = as<IRArrayTypeBase>(type))
+        {
+            arrayDepth++;
+            type = arrayType->getElementType();
+        }
+
+        String baseName;
         // Get a human-readable name for the resource type
         switch (type->getOp())
         {
         case kIROp_HLSLStructuredBufferType:
-            return "StructuredBuffer";
+            baseName = "StructuredBuffer";
+            break;
         case kIROp_HLSLRWStructuredBufferType:
-            return "RWStructuredBuffer";
+            baseName = "RWStructuredBuffer";
+            break;
         case kIROp_HLSLByteAddressBufferType:
-            return "ByteAddressBuffer";
+            baseName = "ByteAddressBuffer";
+            break;
         case kIROp_HLSLRWByteAddressBufferType:
-            return "RWByteAddressBuffer";
+            baseName = "RWByteAddressBuffer";
+            break;
         case kIROp_SamplerStateType:
-            return "SamplerState";
+            baseName = "SamplerState";
+            break;
         case kIROp_SamplerComparisonStateType:
-            return "SamplerComparisonState";
+            baseName = "SamplerComparisonState";
+            break;
         case kIROp_TextureType:
         {
             auto textureType = as<IRTextureType>(type);
@@ -854,13 +1379,25 @@ struct BindlessResourceLoweringContext
                 }
                 if (textureType->isArray())
                     sb << "Array";
-                return sb.produceString();
+                baseName = sb.produceString();
+                break;
             }
-            return "Texture";
+            baseName = "Texture";
+            break;
         }
         default:
-            return "Resource";
+            baseName = "Resource";
+            break;
         }
+
+        if (arrayDepth == 0)
+            return baseName;
+
+        StringBuilder sb;
+        sb << baseName;
+        for (int i = 0; i < arrayDepth; ++i)
+            sb << "[]";
+        return sb.produceString();
     }
 };
 

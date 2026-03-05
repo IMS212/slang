@@ -32,8 +32,24 @@ enum class BindlessResourceType
 /// @param resourceName The name of the resource
 /// @param resourceType The type category (determines which heap binding)
 /// @param userData User-provided context pointer
-/// @return Index buffer slot for this resource, or -1 to skip (not bindless)
+/// @return Descriptor heap index for this resource, or -1 to skip (not bindless)
 typedef slang::SlangBindlessResolverCallback BindlessResolverCallback;
+
+/// Callback type for resolving bindless resource array base indices.
+/// Called during IR lowering (after DCE) for each actually-used resource array.
+/// Uses SlangBindlessResourceType from slang.h for ABI compatibility.
+/// @param resourceName The name of the resource array
+/// @param resourceType The type category (determines which heap binding)
+/// @param shaderArrayLength Declared array length in shader, or -1 for unsized
+/// @param outResolvedArrayLength Resolved array length written by callback
+/// @param userData User-provided context pointer
+/// @return Base descriptor heap index for this resource array, or -1 to skip (not bindless)
+typedef slang::SlangBindlessArrayResolverCallback BindlessArrayResolverCallback;
+
+/// Callback type for resolving fixed sampler descriptor indices used when
+/// lowering combined texture-sampler resources to texture + sampler pairs.
+typedef slang::SlangBindlessCombinedSamplerResolverCallback
+    BindlessCombinedSamplerResolverCallback;
 
 /// Information about a resource that was converted to bindless access.
 struct BindlessConvertedResource
@@ -48,12 +64,12 @@ struct BindlessConvertedResource
 /// Lower global resources to bindless descriptor handle access.
 ///
 /// This pass transforms global resource parameters (Texture2D, RWStructuredBuffer, etc.)
-/// into DescriptorHandle-based lookups from an index buffer.
+/// into direct descriptor heap lookups using resolved descriptor indices.
 ///
 /// For each resource in the provided name-to-index map (stored in TargetProgram),
 /// the pass:
-/// 1. Creates a global index buffer (StructuredBuffer<uint2>) at set 1, binding 3
-/// 2. Replaces resource uses with DescriptorHandle<T>(indexBuffer[STATIC_INDEX])
+/// 1. Resolves a descriptor index (or base index for arrays) from map/callback
+/// 2. Replaces resource uses with direct heap indexing: resourceHeap[resolvedIndex]
 /// 3. Reports converted resources via the output list
 ///
 /// Resources not found in the map are left unchanged and a warning is emitted.

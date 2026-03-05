@@ -17,10 +17,8 @@
 /*
  * Bindless resolver callback
  *
- * Called during linking to resolve index buffer slots for resources.
- * The returned index is a slot in the index buffer (StructuredBuffer<uint2>
- * at set 1, binding 3). At runtime, you fill indexBuffer[slot].x with the
- * actual descriptor heap index.
+ * Called during linking to resolve descriptor indices for resources.
+ * The returned value is used directly for resourceHeap[index].
  *
  * The resourceType tells you which descriptor heap binding (0-5) this
  * resource will use, so you can set up the corresponding heap entry.
@@ -28,6 +26,17 @@
  * Returns -1 to skip a resource (leave it as regular binding).
  */
 static int nextIndexBufferSlot = 0;
+static bool sawWorldData = false;
+static bool sawStandaloneTexture = false;
+static bool sawMaterialTexturesArray = false;
+static bool sawMainTextureCombinedSampler = false;
+static bool sawStandaloneCombinedSampler = false;
+static bool sawMaterialCombinedArray = false;
+
+static bool streq(const char* a, const char* b)
+{
+    return strcmp(a, b) == 0;
+}
 
 int bindlessResolver(
     const char* resourceName,
@@ -69,23 +78,76 @@ int bindlessResolver(
         break;
     }
 
-    /* Allocate a slot in the index buffer for this resource */
-    int slot = nextIndexBufferSlot++;
+    int descriptorIndex = nextIndexBufferSlot++;
 
-    printf("  Resolver: %s (%s, heap binding %d) -> index buffer slot %d\n",
-           resourceName, typeName, heapBinding, slot);
+    if (streq(resourceName, "worldData"))
+        sawWorldData = true;
+    if (streq(resourceName, "standaloneTexture"))
+        sawStandaloneTexture = true;
+
+    printf("  Resolver: %s (%s, heap binding %d) -> descriptor index %d\n",
+           resourceName, typeName, heapBinding, descriptorIndex);
 
     /*
-     * At runtime, you would:
-     * 1. Allocate a descriptor in the appropriate heap (binding heapBinding)
-     * 2. Write the descriptor's heap index to indexBuffer[slot].x
-     *
-     * For example, if 'diffuse' gets slot 0 and you put it at heap index 42:
-     *   indexBuffer[0] = uint2(42, 0);
-     * Then the shader will load from textureHeap[42].
+     * The descriptor index must be valid in the currently bound heap.
      */
 
-    return slot;
+    return descriptorIndex;
+}
+
+/*
+ * Bindless array resolver callback
+ *
+ * Called during linking for object arrays (e.g. Texture2D[]). The returned
+ * value is the base descriptor index. The compiler will emit:
+ *
+ *   resourceHeap[baseIndex + userIndex]
+ *
+ * We reserve a contiguous range [baseIndex, baseIndex + arrayLength).
+ */
+int bindlessArrayResolver(
+    const char* resourceName,
+    SlangcBindlessResourceType resourceType,
+    int shaderArrayLength,
+    int* outResolvedArrayLength,
+    void* userData)
+{
+    (void)userData;
+
+    int resolvedArrayLength = shaderArrayLength >= 0 ? shaderArrayLength : 4;
+    if (outResolvedArrayLength)
+        *outResolvedArrayLength = resolvedArrayLength;
+
+    int baseIndex = nextIndexBufferSlot;
+    nextIndexBufferSlot += resolvedArrayLength;
+
+    printf(
+        "  Array resolver: %s (type %d) length %d -> base descriptor index %d\n",
+        resourceName,
+        (int)resourceType,
+        resolvedArrayLength,
+        baseIndex);
+
+    if (streq(resourceName, "materialTextures"))
+        sawMaterialTexturesArray = true;
+    if (streq(resourceName, "materialCombined"))
+        sawMaterialCombinedArray = true;
+
+    return baseIndex;
+}
+
+int bindlessCombinedSamplerResolver(const char* resourceName, void* userData)
+{
+    (void)userData;
+    /* Use sampler descriptor 0 for all rewritten Sampler2D bindless accesses in this example. */
+    printf("  Combined sampler resolver: %s -> sampler descriptor index 0\n", resourceName);
+
+    if (streq(resourceName, "mainTexture"))
+        sawMainTextureCombinedSampler = true;
+    if (streq(resourceName, "standaloneCombined"))
+        sawStandaloneCombinedSampler = true;
+
+    return 0;
 }
 
 
@@ -205,6 +267,8 @@ int main(int argc, char** argv)
     slangc_addEntryPoint(program, engine, "vertexMain", SLANGC_STAGE_VERTEX);
     slangc_addEntryPoint(program, engine, "fragmentMain", SLANGC_STAGE_FRAGMENT);
     slangc_setBindlessResolver(compiler, bindlessResolver, NULL);
+    slangc_setBindlessArrayResolver(compiler, bindlessArrayResolver, NULL);
+    slangc_setBindlessCombinedSamplerResolver(compiler, bindlessCombinedSamplerResolver, NULL);
 
     int paramCount = slangc_getSpecializationParamCount(program);
     printf("Specialization parameters required: %d\n", paramCount);
@@ -227,6 +291,22 @@ int main(int argc, char** argv)
     }
 
     printf("\nLinking successful!\n\n");
+
+    if (!(sawStandaloneTexture && sawMaterialTexturesArray && sawStandaloneCombinedSampler &&
+          sawMaterialCombinedArray && sawWorldData && sawMainTextureCombinedSampler))
+    {
+        printf("Error: bindless test coverage incomplete.\n");
+        printf("  worldData: %s\n", sawWorldData ? "yes" : "no");
+        printf("  standaloneTexture: %s\n", sawStandaloneTexture ? "yes" : "no");
+        printf("  materialTextures[]: %s\n", sawMaterialTexturesArray ? "yes" : "no");
+        printf("  mainTexture Sampler2D: %s\n", sawMainTextureCombinedSampler ? "yes" : "no");
+        printf("  standaloneCombined Sampler2D: %s\n", sawStandaloneCombinedSampler ? "yes" : "no");
+        printf("  materialCombined[]: %s\n", sawMaterialCombinedArray ? "yes" : "no");
+        slangc_destroyProgram(program);
+        slangc_destroyCompiler(compiler);
+        slangc_destroyGlobalSession(globalSession);
+        return 1;
+    }
 
     /* Get SPIRV code */
     SlangcBlob spirv = slangc_getCode(program);

@@ -4331,26 +4331,21 @@ RefPtr<ProgramLayout> generateParameterBindings(TargetProgram* targetProgram, Di
     if (targetCaps.atLeastOneSetImpliedInOther(CapabilitySet(CapabilityName::descriptor_handle)) ==
         CapabilitySet::ImpliesReturnFlags::Implied)
     {
-        // Check if user has specified a preferred bindless space index
+        // If the user explicitly requested a bindless space index, honor it exactly.
+        // Some runtimes bind descriptor sets at fixed indices and expect Slang not to remap.
+        bool hasExplicitBindlessSpaceIndex =
+            targetProgram->getOptionSet().hasOption(CompilerOptionName::BindlessSpaceIndex);
         int requestedIndex =
             targetProgram->getOptionSet().getIntOption(CompilerOptionName::BindlessSpaceIndex);
 
-        // Try to use the requested index, or find the next available one
         int availableIndex = requestedIndex;
-        while (sharedContext.usedSpaces.contains(availableIndex))
+        if (!hasExplicitBindlessSpaceIndex)
         {
-            availableIndex++;
-        }
-
-        // Warn if we had to use a different index than requested
-        if (availableIndex != requestedIndex &&
-            targetProgram->getOptionSet().hasOption(CompilerOptionName::BindlessSpaceIndex))
-        {
-            sink->diagnose(
-                SourceLoc(),
-                Diagnostics::requestedBindlessSpaceIndexUnavailable,
-                requestedIndex,
-                availableIndex);
+            // No explicit request: find the next unused space to avoid collisions.
+            while (sharedContext.usedSpaces.contains(availableIndex))
+            {
+                availableIndex++;
+            }
         }
 
         markSpaceUsed(&context, nullptr, availableIndex);

@@ -4936,6 +4936,10 @@ $(type_info.return_type) $(type_info.method_name)(
     {
         addDecoration(value, kIROp_HasExplicitHLSLBindingDecoration);
     }
+    void addHasExplicitVulkanBindingDecoration(IRInst* value)
+    {
+        addDecoration(value, kIROp_HasExplicitVulkanBindingDecoration);
+    }
     void addDefaultValueDecoration(IRInst* value, IRInst* defaultValue)
     {
         addDecoration(value, kIROp_DefaultValueDecoration, defaultValue);

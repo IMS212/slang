@@ -2363,6 +2363,18 @@ DIAGNOSTIC(
     "resource '$0' is used but not found in bindless resource index map")
 
 DIAGNOSTIC(
+    41027,
+    Warning,
+    arrayResourceConflictsWithScalarBindlessBinding,
+    "array resource '$0' is used but only a scalar bindless binding exists with the same name")
+
+DIAGNOSTIC(
+    41028,
+    Error,
+    bindlessArrayLengthMismatch,
+    "bindless array resolver returned length '$1' for resource '$0', but shader declares length '$2'")
+
+DIAGNOSTIC(
     41024,
     Error,
     cannotDefaultInitializeResource,

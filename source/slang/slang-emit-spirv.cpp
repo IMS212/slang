@@ -20,6 +20,101 @@
 namespace Slang
 {
 
+static bool _spvTryGetDescriptorTableSlotBinding(IRInst* varLikeInst, UInt& outBinding)
+{
+    auto layoutDecor = varLikeInst->findDecoration<IRLayoutDecoration>();
+    if (!layoutDecor)
+        return false;
+    auto varLayout = as<IRVarLayout>(layoutDecor->getLayout());
+    if (!varLayout)
+        return false;
+    for (auto rr : varLayout->getOffsetAttrs())
+    {
+        if (rr->getResourceKind() == LayoutResourceKind::DescriptorTableSlot)
+        {
+            outBinding = rr->getOffset();
+            return true;
+        }
+    }
+    return false;
+}
+
+static IRInst* _spvFindBindlessHeapGlobalParam(
+    IRModule* module,
+    UInt bindingIndex,
+    IRType* elementType)
+{
+    auto wantedElementType = (IRType*)unwrapAttributedType(elementType);
+    bool wantAnySamplerHeap =
+        wantedElementType &&
+        (wantedElementType->getOp() == kIROp_SamplerStateType ||
+         wantedElementType->getOp() == kIROp_SamplerComparisonStateType);
+    IRInst* samplerBindingFallback = nullptr;
+    IRInst* uniqueBindingFallback = nullptr;
+    bool sawMultipleBindingCandidates = false;
+    for (auto globalInst : module->getGlobalInsts())
+    {
+        if (!as<IRGlobalParam>(globalInst) && !as<IRGlobalVar>(globalInst))
+            continue;
+        // Only match synthetic bindless heaps created by lower-bindless-resources.
+        // Real globals can share the same binding number in a different register space/set.
+        auto nameHint = globalInst->findDecoration<IRNameHintDecoration>();
+        if (!nameHint || nameHint->getName() != "__slang_resource_heap")
+            continue;
+
+        IRType* heapType = (IRType*)unwrapAttributedType(globalInst->getDataType());
+        if (auto ptrType = as<IRPtrTypeBase>(heapType))
+            heapType = (IRType*)unwrapAttributedType(ptrType->getValueType());
+
+        auto arrayType = as<IRArrayTypeBase>(heapType);
+        if (!arrayType)
+            continue;
+        UInt binding = 0;
+        if (!_spvTryGetDescriptorTableSlotBinding(globalInst, binding))
+            continue;
+        if (binding != bindingIndex)
+            continue;
+
+        if (!uniqueBindingFallback)
+            uniqueBindingFallback = globalInst;
+        else
+            sawMultipleBindingCandidates = true;
+
+        auto heapElementType = (IRType*)unwrapAttributedType(arrayType->getElementType());
+        if (heapElementType == wantedElementType || isTypeEqual(heapElementType, wantedElementType))
+            return globalInst;
+
+        if (wantAnySamplerHeap)
+        {
+            if (heapElementType &&
+                (heapElementType->getOp() == kIROp_SamplerStateType ||
+                 heapElementType->getOp() == kIROp_SamplerComparisonStateType))
+                samplerBindingFallback = globalInst;
+        }
+    }
+    if (samplerBindingFallback)
+        return samplerBindingFallback;
+    if (!sawMultipleBindingCandidates)
+        return uniqueBindingFallback;
+    return nullptr;
+}
+
+static IRType* _spvGetUncombinedTextureType(IRBuilder& builder, IRTextureType* textureType)
+{
+    if (!textureType || !textureType->isCombined())
+        return textureType;
+    return builder.getTextureType(
+        textureType->getElementType(),
+        textureType->getShapeInst(),
+        textureType->getIsArrayInst(),
+        textureType->getIsMultisampleInst(),
+        textureType->getSampleCountInst(),
+        textureType->getAccessInst(),
+        textureType->getIsShadowInst(),
+        builder.getIntValue(builder.getIntType(), 0),
+        textureType->getFormatInst());
+}
+
 // Our goal in this file is to convert a module in the Slang IR over to an
 // equivalent module in the SPIR-V intermediate language.
 //
@@ -4867,6 +4962,102 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         case kIROp_MakeVector:
             result = emitConstruct(parent, inst);
             break;
+        case kIROp_MakeCombinedTextureSamplerFromHandle:
+            {
+                auto combinedType = as<IRTextureType>(inst->getDataType());
+                if (!combinedType || !combinedType->isCombined())
+                    SLANG_UNEXPECTED("MakeCombinedTextureSamplerFromHandle expects a combined texture type.");
+
+                IRBuilder builder(inst);
+
+                auto handle = inst->getOperand(0);
+                IRInst* textureIndex = nullptr;
+                IRInst* samplerIndex = nullptr;
+                if (auto makeVec = as<IRMakeVector>(handle))
+                {
+                    if (makeVec->getOperandCount() >= 2)
+                    {
+                        textureIndex = makeVec->getOperand(0);
+                        samplerIndex = makeVec->getOperand(1);
+                    }
+                }
+                if (!textureIndex || !samplerIndex)
+                    SLANG_UNEXPECTED(
+                        "MakeCombinedTextureSamplerFromHandle expects a packed uint2 from bindless "
+                        "lowering.");
+
+                auto textureType = _spvGetUncombinedTextureType(builder, combinedType);
+                auto samplerType = getIntVal(combinedType->getIsShadowInst()) != 0
+                                       ? builder.getType(kIROp_SamplerComparisonStateType)
+                                       : builder.getType(kIROp_SamplerStateType);
+
+                auto textureHeap = _spvFindBindlessHeapGlobalParam(m_irModule, 2, textureType);
+                auto samplerHeap = _spvFindBindlessHeapGlobalParam(m_irModule, 0, samplerType);
+                if (!textureHeap || !samplerHeap)
+                {
+                    SLANG_UNEXPECTED(
+                        "Failed to find bindless texture/sampler heaps for "
+                        "MakeCombinedTextureSamplerFromHandle.");
+                }
+
+                auto textureHeapPtrType = as<IRPtrTypeBase>(unwrapAttributedType(textureHeap->getDataType()));
+                auto samplerHeapPtrType = as<IRPtrTypeBase>(unwrapAttributedType(samplerHeap->getDataType()));
+                auto textureAddrSpace = textureHeapPtrType && textureHeapPtrType->hasAddressSpace()
+                                            ? textureHeapPtrType->getAddressSpace()
+                                            : AddressSpace::UniformConstant;
+                auto samplerAddrSpace = samplerHeapPtrType && samplerHeapPtrType->hasAddressSpace()
+                                            ? samplerHeapPtrType->getAddressSpace()
+                                            : AddressSpace::UniformConstant;
+
+                auto textureElemPtrType =
+                    builder.getPtrType(kIROp_PtrType, textureType, textureAddrSpace);
+                auto samplerElemPtrType =
+                    builder.getPtrType(kIROp_PtrType, samplerType, samplerAddrSpace);
+
+                auto texturePtr = emitOpAccessChain(
+                    parent,
+                    nullptr,
+                    textureElemPtrType,
+                    textureHeap,
+                    makeArray(textureIndex));
+                auto textureVal = emitInstCustomOperandFunc(
+                    parent,
+                    nullptr,
+                    SpvOpLoad,
+                    [&]()
+                    {
+                        emitOperand(textureType);
+                        emitOperand(kResultID);
+                        emitOperand(texturePtr);
+                    });
+
+                auto samplerPtr = emitOpAccessChain(
+                    parent,
+                    nullptr,
+                    samplerElemPtrType,
+                    samplerHeap,
+                    makeArray(samplerIndex));
+                auto samplerVal = emitInstCustomOperandFunc(
+                    parent,
+                    nullptr,
+                    SpvOpLoad,
+                    [&]()
+                    {
+                        emitOperand(samplerType);
+                        emitOperand(kResultID);
+                        emitOperand(samplerPtr);
+                    });
+
+                result = emitInst(
+                    parent,
+                    inst,
+                    SpvOpSampledImage,
+                    inst->getFullType(),
+                    kResultID,
+                    textureVal,
+                    samplerVal);
+                break;
+            }
         case kIROp_MakeVectorFromScalar:
             {
                 const auto scalar = inst->getOperand(0);
@@ -6155,6 +6346,40 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         return false;
     }
 
+    void maybeEmitArrayStrideDecorationForPhysicalFieldType(IRType* type, IRTypeLayoutRules* rule)
+    {
+        type = (IRType*)unwrapAttributedType(type);
+        auto arrayType = as<IRArrayTypeBase>(type);
+        if (!arrayType)
+            return;
+
+        auto elementType = (IRType*)unwrapAttributedType(arrayType->getElementType());
+        if (!isIROpaqueType(elementType) && shouldEmitArrayStride(elementType) &&
+            arrayType->getOp() == kIROp_ArrayType && !arrayType->getArrayStride())
+        {
+            auto spvArrayType = ensureInst(arrayType);
+            auto spvArrayTypeId = getID(spvArrayType);
+            if (m_decoratedSpvInsts.add(spvArrayTypeId))
+            {
+                IRSizeAndAlignment elementSizeAndAlignment;
+                getSizeAndAlignment(m_targetRequest, rule, elementType, &elementSizeAndAlignment);
+                auto alignedElement = rule->alignCompositeElement(elementSizeAndAlignment);
+                auto stride = (int32_t)alignedElement.getStride();
+                if (stride > 0)
+                {
+                    emitOpDecorateArrayStride(
+                        getSection(SpvLogicalSectionID::Annotations),
+                        nullptr,
+                        spvArrayType,
+                        SpvLiteralInteger::from32((uint32_t)stride));
+                }
+            }
+        }
+
+        // Handle nested arrays (e.g., array-of-array) recursively.
+        maybeEmitArrayStrideDecorationForPhysicalFieldType(elementType, rule);
+    }
+
     void emitLayoutDecorations(IRStructType* structType, SpvWord spvStructID)
     {
         /*****
@@ -6294,6 +6519,8 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 spvStructID,
                 SpvLiteralInteger::from32(id),
                 SpvLiteralInteger::from32(int32_t(offset)));
+            auto rule = IRTypeLayoutRules::get(layoutRuleName);
+            maybeEmitArrayStrideDecorationForPhysicalFieldType(field->getFieldType(), rule);
             auto matrixType = as<IRMatrixType>(field->getFieldType());
             auto arrayType = as<IRArrayTypeBase>(field->getFieldType());
             if (!matrixType && arrayType)
@@ -6309,7 +6536,6 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 // of the rows in a RowMajor - decorated matrix or columns in a
                 // ColMajor - decorated matrix.
                 IRIntegerValue matrixStride = 0;
-                auto rule = IRTypeLayoutRules::get(layoutRuleName);
                 IRSizeAndAlignment elementSizeAlignment;
                 getSizeAndAlignment(
                     m_targetRequest,

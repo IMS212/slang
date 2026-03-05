@@ -16,6 +16,98 @@
 namespace Slang
 {
 
+static bool _tryGetDescriptorTableSlotBinding(IRInst* varLikeInst, UInt& outBinding)
+{
+    auto layoutDecor = varLikeInst->findDecoration<IRLayoutDecoration>();
+    if (!layoutDecor)
+        return false;
+    auto varLayout = as<IRVarLayout>(layoutDecor->getLayout());
+    if (!varLayout)
+        return false;
+    for (auto rr : varLayout->getOffsetAttrs())
+    {
+        if (rr->getResourceKind() == LayoutResourceKind::DescriptorTableSlot)
+        {
+            outBinding = rr->getOffset();
+            return true;
+        }
+    }
+    return false;
+}
+
+static IRInst* _findBindlessHeapGlobalParam(IRModule* module, UInt bindingIndex, IRType* elementType)
+{
+    auto wantedElementType = (IRType*)unwrapAttributedType(elementType);
+    bool wantAnySamplerHeap =
+        wantedElementType &&
+        (wantedElementType->getOp() == kIROp_SamplerStateType ||
+         wantedElementType->getOp() == kIROp_SamplerComparisonStateType);
+    IRInst* samplerBindingFallback = nullptr;
+    IRInst* uniqueBindingFallback = nullptr;
+    bool sawMultipleBindingCandidates = false;
+    for (auto globalInst : module->getGlobalInsts())
+    {
+        if (!as<IRGlobalParam>(globalInst) && !as<IRGlobalVar>(globalInst))
+            continue;
+        // Only match synthetic bindless heaps created by lower-bindless-resources.
+        // Real globals can share the same binding number in a different register space/set.
+        auto nameHint = globalInst->findDecoration<IRNameHintDecoration>();
+        if (!nameHint || nameHint->getName() != "__slang_resource_heap")
+            continue;
+
+        IRType* heapType = (IRType*)unwrapAttributedType(globalInst->getDataType());
+        if (auto ptrType = as<IRPtrTypeBase>(heapType))
+            heapType = (IRType*)unwrapAttributedType(ptrType->getValueType());
+
+        auto arrayType = as<IRArrayTypeBase>(heapType);
+        if (!arrayType)
+            continue;
+        UInt binding = 0;
+        if (!_tryGetDescriptorTableSlotBinding(globalInst, binding))
+            continue;
+        if (binding != bindingIndex)
+            continue;
+
+        if (!uniqueBindingFallback)
+            uniqueBindingFallback = globalInst;
+        else
+            sawMultipleBindingCandidates = true;
+
+        auto heapElementType = (IRType*)unwrapAttributedType(arrayType->getElementType());
+        if (heapElementType == wantedElementType || isTypeEqual(heapElementType, wantedElementType))
+            return globalInst;
+
+        if (wantAnySamplerHeap)
+        {
+            if (heapElementType &&
+                (heapElementType->getOp() == kIROp_SamplerStateType ||
+                 heapElementType->getOp() == kIROp_SamplerComparisonStateType))
+                samplerBindingFallback = globalInst;
+        }
+    }
+    if (samplerBindingFallback)
+        return samplerBindingFallback;
+    if (!sawMultipleBindingCandidates)
+        return uniqueBindingFallback;
+    return nullptr;
+}
+
+static IRType* _getUncombinedTextureTypeForEmitter(IRBuilder& builder, IRTextureType* textureType)
+{
+    if (!textureType || !textureType->isCombined())
+        return textureType;
+    return builder.getTextureType(
+        textureType->getElementType(),
+        textureType->getShapeInst(),
+        textureType->getIsArrayInst(),
+        textureType->getIsMultisampleInst(),
+        textureType->getSampleCountInst(),
+        textureType->getAccessInst(),
+        textureType->getIsShadowInst(),
+        builder.getIntValue(builder.getIntType(), 0),
+        textureType->getFormatInst());
+}
+
 void trackGLSLTargetCaps(ShaderExtensionTracker* extensionTracker, CapabilitySet const& caps);
 
 GLSLSourceEmitter::GLSLSourceEmitter(const Desc& desc)
@@ -2245,6 +2337,66 @@ bool GLSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
 
             maybeCloseParens(needClose);
             // Handled
+            return true;
+        }
+    case kIROp_MakeCombinedTextureSamplerFromHandle:
+        {
+            auto combinedType = as<IRTextureType>(inst->getDataType());
+            if (!combinedType || !combinedType->isCombined())
+                return false;
+
+            IRBuilder builder(inst);
+            auto handle = inst->getOperand(0);
+
+            IRInst* textureIndex = nullptr;
+            IRInst* samplerIndex = nullptr;
+            if (auto makeVec = as<IRMakeVector>(handle))
+            {
+                if (makeVec->getOperandCount() >= 2)
+                {
+                    textureIndex = makeVec->getOperand(0);
+                    samplerIndex = makeVec->getOperand(1);
+                }
+            }
+
+            auto textureType = _getUncombinedTextureTypeForEmitter(builder, combinedType);
+            auto samplerType = getIntVal(combinedType->getIsShadowInst()) != 0
+                                   ? builder.getType(kIROp_SamplerComparisonStateType)
+                                   : builder.getType(kIROp_SamplerStateType);
+            auto textureHeap = _findBindlessHeapGlobalParam(m_irModule, 2, textureType);
+            auto samplerHeap = _findBindlessHeapGlobalParam(m_irModule, 0, samplerType);
+            if (!textureHeap || !samplerHeap)
+                return false;
+
+            auto emitHandleComponent = [&](int index)
+            {
+                if (index == 0 && textureIndex)
+                {
+                    emitOperand(textureIndex, getInfo(EmitOp::General));
+                    return;
+                }
+                if (index == 1 && samplerIndex)
+                {
+                    emitOperand(samplerIndex, getInfo(EmitOp::General));
+                    return;
+                }
+                m_writer->emit("(");
+                emitOperand(handle, getInfo(EmitOp::General));
+                m_writer->emit(index == 0 ? ".x)" : ".y)");
+            };
+
+            emitType(inst->getDataType());
+            m_writer->emit("(");
+            emitOperand(textureHeap, getInfo(EmitOp::General));
+            m_writer->emit("[");
+            emitHandleComponent(0);
+            m_writer->emit("]");
+            m_writer->emit(", ");
+            emitOperand(samplerHeap, getInfo(EmitOp::General));
+            m_writer->emit("[");
+            emitHandleComponent(1);
+            m_writer->emit("]");
+            m_writer->emit(")");
             return true;
         }
     case kIROp_Mul:
