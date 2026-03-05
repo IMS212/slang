@@ -1,10 +1,14 @@
-// TEST(compute, vulkan):COMPARE_COMPUTE_EX(filecheck-buffer=BUFFER):-vk -compute -shaderobj -xslang -experimental-feature -output-using-type -xslang -DTEST_HALF=0 -xslang -DTEST_POINTER=0 -emit-spirv-directly
-// TEST(compute, vulkan):COMPARE_COMPUTE_EX(filecheck-buffer=BUFFER):-cuda -compute -shaderobj -output-using-type -capability cuda_sm_7_0  -xslang -experimental-feature -xslang -DTEST_HALF=0 -xslang -DTEST_POINTER=0
-// TEST(compute, vulkan):COMPARE_COMPUTE_EX(filecheck-buffer=BUFFER):-cuda -compute -shaderobj -output-using-type -capability cuda_sm_7_0  -xslang -experimental-feature -xslang -DTEST_HALF=1 -xslang -DTEST_POINTER=0
-// TEST(compute, vulkan):COMPARE_COMPUTE_EX(filecheck-buffer=BUFFER):-cuda -compute -shaderobj -output-using-type -capability cuda_sm_7_0  -xslang -experimental-feature -xslang -DTEST_HALF=0 -xslang -DTEST_POINTER=1
-// TEST(compute, vulkan):COMPARE_COMPUTE_EX(filecheck-buffer=BUFFER):-cuda -compute -shaderobj -output-using-type -capability cuda_sm_7_0  -xslang -experimental-feature -xslang -DTEST_HALF=1 -xslang -DTEST_POINTER=1
+// TEST(compute, vulkan):COMPARE_COMPUTE_EX(filecheck-buffer=BUFFER):-vk -compute -shaderobj -xslang -experimental-feature -output-using-type -xslang -DTEST_HALF=0 -xslang -DTEST_POINTER=0 -emit-spirv-directly -xslang -DTEST_TENSORVIEW=0
+// TEST(compute, vulkan):COMPARE_COMPUTE_EX(filecheck-buffer=BUFFER):-cuda -compute -shaderobj -output-using-type -capability cuda_sm_7_0  -xslang -experimental-feature -xslang -DTEST_HALF=0 -xslang -DTEST_POINTER=0 -xslang -DTEST_TENSORVIEW=0
+// TEST(compute, vulkan):COMPARE_COMPUTE_EX(filecheck-buffer=BUFFER):-cuda -compute -shaderobj -output-using-type -capability cuda_sm_7_0  -xslang -experimental-feature -xslang -DTEST_HALF=1 -xslang -DTEST_POINTER=0 -xslang -DTEST_TENSORVIEW=0
+// TEST(compute, vulkan):COMPARE_COMPUTE_EX(filecheck-buffer=BUFFER):-cuda -compute -shaderobj -output-using-type -capability cuda_sm_7_0  -xslang -experimental-feature -xslang -DTEST_HALF=0 -xslang -DTEST_POINTER=1 -xslang -DTEST_TENSORVIEW=0
+// TEST(compute, vulkan):COMPARE_COMPUTE_EX(filecheck-buffer=BUFFER):-cuda -compute -shaderobj -output-using-type -capability cuda_sm_7_0  -xslang -experimental-feature -xslang -DTEST_HALF=1 -xslang -DTEST_POINTER=1 -xslang -DTEST_TENSORVIEW=0
+//
+// Compile-only test for TorchTensorViewAddress (CUDA target):
+// TEST:SIMPLE(filecheck=CHECK): -target ptx -stage compute -entry computeMain -capability cuda_sm_7_0 -DTEST_HALF=0 -DTEST_TENSORVIEW=1 -DTEST_POINTER=0 -experimental-feature
+// CHECK: computeMain
 
-import neural;
+import slang.neural;
 
 #if TEST_HALF
 typealias ElementType = half;
@@ -28,7 +32,11 @@ uniform RWStructuredBuffer<float> parametersFloat;
 // set up a 2x4 matrix for derivative of parameters, the last 2 elements are for derivative of bias
 //TEST_INPUT: set dParameters = ubuffer(data=[0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0], stride=4)
 
-#if TEST_POINTER
+#if TEST_TENSORVIEW
+    uniform TensorView<ElementType> parameters;
+    uniform TensorView<ElementType> dParameters;
+    typealias Address = TorchTensorViewAddress<ElementType>;
+#elif TEST_POINTER
     uniform ElementType* parameters;
     uniform ElementType* dParameters;
     typealias Address = PointerAddress<ElementType>;
@@ -75,9 +83,8 @@ OutputVector MatVecMulAdd<InputVector, OutputVector>(
 // Basic test on MatMul without bias, this test covers both forward and backward pass
 void BasicTestWithoutBias(int tid, int resIndex)
 {
-    typealias ShMemPool = SharedMemoryPool<ShMemSizeLayer1>;
-    typealias InVectorType = WaveTangledVector<ElementType, ShMemPool, InputSize, SubgroupSize>;
-    typealias OutVectorType = WaveTangledVector<ElementType, ShMemPool, OutputSize, SubgroupSize>;
+    typealias InVectorType = WaveTangledVector<ElementType, ShMemSizeLayer1, InputSize, SubgroupSize>;
+    typealias OutVectorType = WaveTangledVector<ElementType, ShMemSizeLayer1, OutputSize, SubgroupSize>;
 
     ElementType[InputSize] inputData = { ElementType(1.0), ElementType(2.0), ElementType(3.0), ElementType(4.0) };
     InVectorType input = InVectorType(inputData);
@@ -128,9 +135,8 @@ void BasicTestWithoutBias(int tid, int resIndex)
 // Basic test on MatMul with bias, this test covers both forward and backward pass
 void BasicTestWithBias(int tid, int resIndex)
 {
-    typealias ShMemPool = SharedMemoryPool<ShMemSizeLayer1>;
-    typealias InVectorType = WaveTangledVector<ElementType, ShMemPool, InputSize, SubgroupSize>;
-    typealias OutVectorType = WaveTangledVector<ElementType, ShMemPool, OutputSize, SubgroupSize>;
+    typealias InVectorType = WaveTangledVector<ElementType, ShMemSizeLayer1, InputSize, SubgroupSize>;
+    typealias OutVectorType = WaveTangledVector<ElementType, ShMemSizeLayer1, OutputSize, SubgroupSize>;
 
     ElementType[InputSize] inputData = { ElementType(1.0), ElementType(2.0), ElementType(3.0), ElementType(4.0) };
     InVectorType input = InVectorType(inputData);
@@ -145,7 +151,6 @@ void BasicTestWithBias(int tid, int resIndex)
 
     bool isPassed = true;
     isPassed = isPassed && (outputVec[0] == ElementType(39.0) && outputVec[1] == ElementType(80.0));
-
 
     var weightDiffPair = DifferentialPtrPair<Address>(weightAddress, dWeightAddress);
     var biasDiffPair = DifferentialPtrPair<Address>(biasAddress, dBiasAddress);
@@ -173,7 +178,6 @@ void BasicTestWithBias(int tid, int resIndex)
     // dBias = {1, 1}
     isPassed = isPassed &&
         dParameters[8] == 32.0 && dParameters[9] == 32.0;
-
 
     isPassed = WaveActiveAllTrue(isPassed);
     if (tid == 0)
@@ -251,5 +255,5 @@ void computeMain(uint tid : SV_DispatchThreadID)
 
     cleanupDParameters();
     BasicTestWithBias(tid, 1);
-    // BUFFER: 1
+    // BUFFER-NEXT: 1
 }

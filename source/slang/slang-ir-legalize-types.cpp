@@ -19,6 +19,7 @@
 #include "slang-ir.h"
 #include "slang-legalize-types.h"
 #include "slang-mangle.h"
+#include "slang-rich-diagnostics.h"
 
 namespace Slang
 {
@@ -1975,7 +1976,8 @@ static LegalVal legalizeUndefined(IRTypeLegalizationContext* context, IRInst* in
         if (!loc.isValid())
             loc = getDiagnosticPos(opaqueType);
 
-        context->m_sink->diagnose(loc, Diagnostics::useOfUninitializedOpaqueHandle, opaqueType);
+        context->m_sink->diagnose(
+            Diagnostics::UseOfUninitializedOpaqueHandle{.handleType = opaqueType, .location = loc});
     }
 
     // It is not ideal, but this pass legalizes an undefined value to... nothing.
@@ -2263,9 +2265,8 @@ static LegalVal legalizeCoopMatMapElementIFunc(
                 // If functor legalizes to one or many special (resource) values, we
                 // can't handle this case very easily at the moment, so diagnose an error
                 // instead of crashing.
-                context->m_sink->diagnose(
-                    inst->getIFuncCall(),
-                    Diagnostics::cooperativeMatrixUnsupportedCapture);
+                context->m_sink->diagnose(Diagnostics::CooperativeMatrixUnsupportedCapture{
+                    .location = inst->getIFuncCall()->sourceLoc});
                 return LegalVal();
             }
         }
@@ -3473,7 +3474,9 @@ static LegalVal legalizeGlobalVar(IRTypeLegalizationContext* context, IRGlobalVa
             context->builder->getPtrType(
                 legalValueType.getSimple(),
                 varPtrType ? varPtrType->getAccessQualifier() : AccessQualifier::ReadWrite,
-                varPtrType ? varPtrType->getAddressSpace() : AddressSpace::Global));
+                varPtrType ? varPtrType->getAddressSpace() : AddressSpace::Global,
+                varPtrType ? varPtrType->getDataLayout()
+                           : context->builder->getDefaultBufferLayoutType()));
         return LegalVal::simple(irGlobalVar);
 
     default:
