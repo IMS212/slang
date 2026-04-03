@@ -28,7 +28,6 @@
 #include "slang-ir.h"
 #include "slang-legalize-types.h"
 #include "slang-rich-diagnostics.h"
-
 namespace Slang
 {
 

@@ -10,6 +10,8 @@
 #include "slang-target-program.h"
 #include "slang-diagnostics.h"
 
+#include <climits>
+
 namespace Slang
 {
 
@@ -60,6 +62,67 @@ struct BindlessResourceLoweringContext
         return false;
     }
 
+    bool tryRemoveConvertedGlobalParam(IRGlobalParam* param)
+    {
+        List<IRInst*> removableUsers;
+        for (auto use = param->firstUse; use; use = use->nextUse)
+        {
+            auto user = use->getUser();
+            if (user->getOp() == kIROp_Load && !user->hasUses())
+            {
+                removableUsers.add(user);
+                continue;
+            }
+
+            if (as<IRDecoration>(user) || as<IRStructFieldLayoutAttr>(user))
+            {
+                removableUsers.add(user);
+                continue;
+            }
+
+            return false;
+        }
+
+        for (auto user : removableUsers)
+        {
+            if (user->getParent())
+                user->removeAndDeallocate();
+        }
+
+        if (!param->hasUses())
+        {
+            param->removeAndDeallocate();
+            return true;
+        }
+
+        return false;
+    }
+
+    bool hasPushConstantLayout(IRGlobalParam* globalParam)
+    {
+        if (auto layoutDecor = globalParam->findDecoration<IRLayoutDecoration>())
+        {
+            if (auto varLayout = as<IRVarLayout>(layoutDecor->getLayout()))
+            {
+                if (varLayout->findOffsetAttr(LayoutResourceKind::PushConstantBuffer))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    IRSPIRVAsm* findParentSPIRVAsm(IRInst* inst)
+    {
+        auto parent = inst ? inst->getParent() : nullptr;
+        while (parent)
+        {
+            if (auto asmBlock = as<IRSPIRVAsm>(parent))
+                return asmBlock;
+            parent = parent->getParent();
+        }
+        return nullptr;
+    }
+
     bool getDirectArrayResourceInfo(IRType* type, IRType** outElementType, int* outShaderArrayLength)
     {
         auto arrayType = as<IRArrayTypeBase>(type);
@@ -80,8 +143,47 @@ struct BindlessResourceLoweringContext
         if (outElementType)
             *outElementType = elementType;
         if (outShaderArrayLength)
-            *outShaderArrayLength = shaderArrayLength;
+        *outShaderArrayLength = shaderArrayLength;
         return true;
+    }
+
+    void getArrayResourceInfo(IRType* type, bool& outIsArray, int& outArraySize)
+    {
+        outIsArray = false;
+        outArraySize = 0;
+
+        long long totalSize = 1;
+        while (auto arrayType = as<IRArrayTypeBase>(type))
+        {
+            outIsArray = true;
+
+            if (auto sizedArrayType = as<IRArrayType>(arrayType))
+            {
+                auto elementCount = as<IRIntLit>(sizedArrayType->getElementCount());
+                if (!elementCount || elementCount->getValue() < 0)
+                {
+                    outArraySize = -1;
+                    return;
+                }
+
+                totalSize *= elementCount->getValue();
+                if (totalSize > INT_MAX)
+                {
+                    outArraySize = -1;
+                    return;
+                }
+            }
+            else
+            {
+                outArraySize = -1;
+                return;
+            }
+
+            type = arrayType->getElementType();
+        }
+
+        if (outIsArray)
+            outArraySize = (int)totalSize;
     }
 
     bool isCombinedTextureType(IRType* type)
@@ -356,7 +458,8 @@ struct BindlessResourceLoweringContext
         auto heapPtrType = moduleBuilder.getPtrType(
             unboundedArrayType,
             AccessQualifier::ReadWrite,
-            addrSpace);
+            addrSpace,
+            moduleBuilder.getDefaultBufferLayoutType());
 
         // Create a real global parameter (becomes OpVariable in SPIR-V)
         auto resourceHeap = moduleBuilder.createGlobalParam(heapPtrType);
@@ -822,6 +925,8 @@ struct BindlessResourceLoweringContext
                 continue;
             if (globalParam->findDecoration<IRHasExplicitVulkanBindingDecoration>())
                 continue;
+            if (hasPushConstantLayout(globalParam))
+                continue;
 
             auto paramType = globalParam->getDataType();
             if (!isResourceType(paramType) || !globalParam->hasUses())
@@ -864,12 +969,13 @@ struct BindlessResourceLoweringContext
                     {
                         if (sink)
                         {
-                            sink->diagnose(
-                                globalParam->sourceLoc,
-                                Diagnostics::bindlessArrayLengthMismatch,
-                                name,
-                                resolvedArrayLength,
-                                shaderArrayLength);
+                            StringBuilder sb;
+                            sb << "bindless array resolver returned length "
+                               << resolvedArrayLength
+                               << " for '" << name
+                               << "', but shader declares length "
+                               << shaderArrayLength << ".";
+                            sink->diagnoseRaw(Severity::Warning, sb.getUnownedSlice());
                         }
                         continue;
                     }
@@ -932,10 +1038,10 @@ struct BindlessResourceLoweringContext
             auto nameHint = param->findDecoration<IRNameHintDecoration>();
             if (nameHint && sink)
             {
-                sink->diagnose(
-                    param->sourceLoc,
-                    Diagnostics::resourceNotInBindlessMap,
-                    nameHint->getName());
+                StringBuilder sb;
+                sb << "resource '" << nameHint->getName()
+                   << "' is not in bindless map and no resolver produced an index.";
+                sink->diagnoseRaw(Severity::Warning, sb.getUnownedSlice());
             }
         }
 
@@ -944,10 +1050,10 @@ struct BindlessResourceLoweringContext
             auto nameHint = param->findDecoration<IRNameHintDecoration>();
             if (nameHint && sink)
             {
-                sink->diagnose(
-                    param->sourceLoc,
-                    Diagnostics::arrayResourceConflictsWithScalarBindlessBinding,
-                    nameHint->getName());
+                StringBuilder sb;
+                sb << "array resource '" << nameHint->getName()
+                   << "' conflicts with a scalar bindless binding of the same name.";
+                sink->diagnoseRaw(Severity::Warning, sb.getUnownedSlice());
             }
         }
 
@@ -999,6 +1105,95 @@ struct BindlessResourceLoweringContext
 
         auto baseLiteral = builder.getIntValue(indexType, baseIndex);
         return builder.emitAdd(indexType, baseLiteral, userIndex);
+    }
+
+    IRInst* emitBindlessTextureLookup(
+        IRBuilder& builder,
+        IRType* resourceType,
+        IRInst* heapIndex,
+        bool nonUniformHeapIndex)
+    {
+        auto bindlessLookupType = getUncombinedTextureType(builder, resourceType);
+        int bindingIndex = getBindingIndexForResourceType(bindlessLookupType);
+        bool useSPIRVNonUniformDecoration =
+            isSPIRV(targetProgram->getTargetReq()->getTarget());
+
+        if (nonUniformHeapIndex && !useSPIRVNonUniformDecoration)
+            heapIndex = builder.emitNonUniformResourceIndexInst(heapIndex);
+
+        auto resourceHeap = getOrCreateResourceHeap(bindingIndex, bindlessLookupType);
+        auto elementPtr = builder.emitElementAddress(resourceHeap, heapIndex);
+        if (nonUniformHeapIndex && useSPIRVNonUniformDecoration)
+            builder.addSPIRVNonUniformResourceDecoration(elementPtr);
+
+        auto replacement = builder.emitLoad(bindlessLookupType, elementPtr);
+        if (nonUniformHeapIndex && useSPIRVNonUniformDecoration)
+            builder.addSPIRVNonUniformResourceDecoration(replacement);
+        return replacement;
+    }
+
+    bool tryRewriteAsmImageTypeOperandUse(
+        const String& resourceName,
+        IRType* resourceType,
+        IRUse* use,
+        IRInst* heapIndex,
+        bool nonUniformHeapIndex = false)
+    {
+        SLANG_UNUSED(resourceName);
+
+        auto asmOperand = as<IRSPIRVAsmOperand>(use->getUser());
+        if (!asmOperand)
+            return false;
+
+        switch (asmOperand->getOp())
+        {
+        case kIROp_SPIRVAsmOperandImageType:
+        case kIROp_SPIRVAsmOperandSampledImageType:
+            break;
+        default:
+            return false;
+        }
+
+        List<IRUse*> asmOperandUses;
+        for (auto operandUse = asmOperand->firstUse; operandUse; operandUse = operandUse->nextUse)
+            asmOperandUses.add(operandUse);
+
+        for (auto operandUse : asmOperandUses)
+        {
+            auto operandUser = operandUse->getUser();
+            if (!isInsideFunction(operandUser))
+                continue;
+
+            auto asmBlock = findParentSPIRVAsm(operandUser);
+            if (!asmBlock)
+                continue;
+
+            IRBuilder builder(operandUser);
+            builder.setInsertBefore(operandUser);
+
+            auto replacementValue =
+                emitBindlessTextureLookup(builder, resourceType, heapIndex, nonUniformHeapIndex);
+
+            IRSPIRVAsmOperand* replacementOperand = nullptr;
+            switch (asmOperand->getOp())
+            {
+            case kIROp_SPIRVAsmOperandImageType:
+                replacementOperand = builder.emitSPIRVAsmOperandImageType(replacementValue);
+                break;
+            case kIROp_SPIRVAsmOperandSampledImageType:
+                replacementOperand = builder.emitSPIRVAsmOperandSampledImageType(replacementValue);
+                break;
+            default:
+                SLANG_UNREACHABLE("unexpected asm operand op");
+            }
+
+            builder.replaceOperand(operandUse, replacementOperand);
+        }
+
+        if (!asmOperand->hasUses())
+            asmOperand->removeAndDeallocate();
+
+        return true;
     }
 
     void rewriteResourceUseWithHeapIndex(
@@ -1209,7 +1404,15 @@ struct BindlessResourceLoweringContext
             auto replacement = builder.emitLoad(bindlessLookupType, elementPtr);
             if (nonUniformHeapIndex && useSPIRVNonUniformDecoration)
                 builder.addSPIRVNonUniformResourceDecoration(replacement);
-            builder.replaceOperand(use, replacement);
+            if (user->getOp() == kIROp_Load)
+            {
+                user->replaceUsesWith(replacement);
+                user->removeAndDeallocate();
+            }
+            else
+            {
+                builder.replaceOperand(use, replacement);
+            }
         }
     }
 
@@ -1228,11 +1431,16 @@ struct BindlessResourceLoweringContext
             auto user = use->getUser();
             if (as<IRStructFieldLayoutAttr>(user) || as<IRDecoration>(user))
                 continue;
+
+            auto indexLiteral = builder.getIntValue(builder.getBasicType(BaseType::Int), index);
             if (!isInsideFunction(user))
+            {
+                if (tryRewriteAsmImageTypeOperandUse(name, resourceType, use, indexLiteral))
+                    continue;
                 continue;
+            }
 
             builder.setInsertBefore(user);
-            auto indexLiteral = builder.getIntValue(builder.getBasicType(BaseType::Int), index);
             rewriteResourceUseWithHeapIndex(builder, name, resourceType, use, indexLiteral);
         }
 
@@ -1243,11 +1451,12 @@ struct BindlessResourceLoweringContext
             info.typeName = getResourceTypeName(resourceType);
             info.index = index;
             info.resourceType = getBindlessResourceTypeForIRType(resourceType);
+            getArrayResourceInfo(param->getDataType(), info.isArray, info.arraySize);
             info.access = getResourceAccess(resourceType);
             outConvertedResources->add(info);
         }
 
-        if (!param->hasUses())
+        if (!tryRemoveConvertedGlobalParam(param) && !param->hasUses())
             param->removeAndDeallocate();
     }
 
@@ -1310,11 +1519,12 @@ struct BindlessResourceLoweringContext
             info.typeName = getResourceTypeName(param->getDataType());
             info.index = baseIndex;
             info.resourceType = getBindlessResourceTypeForIRType(resourceType);
+            getArrayResourceInfo(param->getDataType(), info.isArray, info.arraySize);
             info.access = getResourceAccess(resourceType);
             outConvertedResources->add(info);
         }
 
-        if (!param->hasUses())
+        if (!tryRemoveConvertedGlobalParam(param) && !param->hasUses())
             param->removeAndDeallocate();
     }
 

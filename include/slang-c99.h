@@ -80,15 +80,32 @@ typedef enum SlangcResourceAccess {
 } SlangcResourceAccess;
 
 /*
+ * Resource object type
+ */
+typedef enum SlangcResourceObjectType {
+    SLANGC_RESOURCE_OBJECT_UNKNOWN = -1,
+    SLANGC_RESOURCE_OBJECT_COMBINED_TEXTURE_SAMPLER = 0,
+    SLANGC_RESOURCE_OBJECT_SAMPLER = 1,
+    SLANGC_RESOURCE_OBJECT_STORAGE_IMAGE = 2,
+    SLANGC_RESOURCE_OBJECT_SAMPLED_IMAGE = 3,
+    SLANGC_RESOURCE_OBJECT_STORAGE_BUFFER = 4,
+    SLANGC_RESOURCE_OBJECT_UNIFORM_BUFFER = 5,
+    SLANGC_RESOURCE_OBJECT_ACCELERATION_STRUCTURE = 6,
+} SlangcResourceObjectType;
+
+/*
  * Resource information (flat struct for FFI compatibility)
  * String pointers are valid until the program is destroyed.
  */
 typedef struct SlangcResourceInfo {
     const char* name;       /* Resource name */
     const char* typeName;   /* Type name (e.g., "Texture2D", "SamplerState") */
-    int set;                /* Descriptor set (-1 if not applicable) */
-    int binding;            /* Binding number (-1 if not applicable) */
-    int bindlessIndex;      /* Bindless index (-1 if not bindless) */
+    int set;                /* Descriptor set (-1 if not applicable). For bindless resources, this is the heap set. */
+    int binding;            /* Binding number (-1 if not applicable). For bindless resources, this is the heap binding. */
+    int bindlessIndex;      /* Descriptor index within the bindless heap (-1 if not bindless) */
+    SlangcResourceObjectType objectType;  /* Resource object type */
+    int isArray;            /* Non-zero if this resource is an array */
+    int arraySize;          /* -1 for unsized arrays, otherwise the total array element count. 0 if not an array. */
     SlangcResourceAccess access;  /* Access mode (read, write, or read-write) */
 } SlangcResourceInfo;
 
@@ -217,6 +234,12 @@ SLANGC_API SlangcModule slangc_loadModuleFromFile(
     SlangcCompiler compiler,
     const char* path
 );
+
+/* Get the number of file-backed dependencies for this module, including transitive imports/includes. */
+SLANGC_API int slangc_getModuleDependencyFileCount(SlangcModule module);
+
+/* Get the resolved file path for a dependency by index. Returns NULL on invalid input/index. */
+SLANGC_API const char* slangc_getModuleDependencyFilePath(SlangcModule module, int index);
 
 /*
  * Program creation and linking

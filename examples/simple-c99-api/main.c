@@ -224,8 +224,8 @@ int main(int argc, char** argv)
     {
         SlangcResourceInfo info;
         slangc_getBindlessResource(program, i, &info);
-        printf("  %s (%s) -> bindless index %d\n",
-            info.name, info.typeName, info.bindlessIndex);
+        printf("  %s (%s) heap=set%d,binding%d -> bindless index %d\n",
+            info.name, info.typeName, info.set, info.binding, info.bindlessIndex);
     }
     printf("\n");
 
@@ -252,8 +252,8 @@ int main(int argc, char** argv)
         {
             SlangcResourceInfo info;
             slangc_getBindlessResource(program2, i, &info);
-            printf("  %s (%s) -> bindless index %d\n",
-                info.name, info.typeName, info.bindlessIndex);
+            printf("  %s (%s) heap=set%d,binding%d -> bindless index %d\n",
+                info.name, info.typeName, info.set, info.binding, info.bindlessIndex);
         }
     }
     else

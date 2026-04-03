@@ -3687,7 +3687,8 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 kIROp_PtrType,
                 varType,
                 AccessQualifier::ReadWrite,
-                addrSpace);
+                addrSpace,
+                builder.getDefaultBufferLayoutType());
         }
 
         auto varInst = emitOpVariable(
@@ -5095,9 +5096,9 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                                             : AddressSpace::UniformConstant;
 
                 auto textureElemPtrType =
-                    builder.getPtrType(kIROp_PtrType, textureType, textureAddrSpace);
+                    builder.getPtrType(textureType, textureAddrSpace);
                 auto samplerElemPtrType =
-                    builder.getPtrType(kIROp_PtrType, samplerType, samplerAddrSpace);
+                    builder.getPtrType(samplerType, samplerAddrSpace);
 
                 auto texturePtr = emitOpAccessChain(
                     parent,

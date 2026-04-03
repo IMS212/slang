@@ -139,7 +139,6 @@
 #include "slang-vm-bytecode.h"
 
 #include <assert.h>
-
 Slang::String get_slang_cpp_host_prelude();
 Slang::String get_slang_torch_prelude();
 
@@ -2099,12 +2098,19 @@ Result linkAndOptimizeIR(
     SLANG_PASS(collectMetadata, *metadata);
 
     // Copy bindless converted resources to metadata
+    const auto bindlessSpaceIndex = SlangInt(
+        targetProgram->getOptionSet().getIntOption(CompilerOptionName::BindlessSpaceIndex));
     for (const auto& res : bindlessConvertedResources)
     {
         BindlessResourceInfo info;
         info.name = metadata->m_bindlessAllocator.allocate(res.name.getUnownedSlice());
         info.typeName = metadata->m_bindlessAllocator.allocate(res.typeName.getUnownedSlice());
+        info.set = bindlessSpaceIndex;
+        info.binding = SlangInt(static_cast<int>(res.resourceType));
         info.index = res.index;
+        info.resourceType = static_cast<slang::SlangBindlessResourceType>(res.resourceType);
+        info.isArray = res.isArray ? 1 : 0;
+        info.arraySize = res.arraySize;
         info.access = res.access;
         metadata->m_bindlessConvertedResources.add(info);
     }

@@ -58,6 +58,8 @@ struct BindlessConvertedResource
     String typeName;
     int index;
     BindlessResourceType resourceType;
+    bool isArray = false;
+    int arraySize = 0;
     ::SlangResourceAccess access;  ///< Access mode (uses SlangResourceAccess enum from slang.h)
 };
 

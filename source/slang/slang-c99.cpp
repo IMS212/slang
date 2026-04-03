@@ -5,6 +5,7 @@
 #include "slang.h"
 #include "slang-com-ptr.h"
 #include "slang-linkable.h"
+#include "slang-module.h"
 #include "slang-ast-support-types.h"
 #include "slang-ast-decl.h"
 #include "../../source/compiler-core/slang-artifact-associated.h"
@@ -12,9 +13,9 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <functional>
 #include <memory>
+#include <limits>
 
 using namespace Slang;
 
@@ -110,6 +111,9 @@ struct ResourceInfoStorage
     int set;
     int binding;
     int bindlessIndex;
+    SlangcResourceObjectType objectType;
+    int isArray;
+    int arraySize;
     SlangcResourceAccess access;
 };
 
@@ -219,6 +223,158 @@ static SlangcResourceAccess toC99Access(SlangResourceAccess access)
     default:
         return SLANGC_ACCESS_READ_WRITE;
     }
+}
+
+static SlangcResourceObjectType toC99ObjectType(slang::SlangBindlessResourceType resourceType)
+{
+    switch (resourceType)
+    {
+    case slang::SLANG_BINDLESS_RESOURCE_TYPE_COMBINED_TEXTURE_SAMPLER:
+        return SLANGC_RESOURCE_OBJECT_COMBINED_TEXTURE_SAMPLER;
+    case slang::SLANG_BINDLESS_RESOURCE_TYPE_SAMPLER:
+        return SLANGC_RESOURCE_OBJECT_SAMPLER;
+    case slang::SLANG_BINDLESS_RESOURCE_TYPE_STORAGE_IMAGE:
+        return SLANGC_RESOURCE_OBJECT_STORAGE_IMAGE;
+    case slang::SLANG_BINDLESS_RESOURCE_TYPE_SAMPLED_IMAGE:
+        return SLANGC_RESOURCE_OBJECT_SAMPLED_IMAGE;
+    case slang::SLANG_BINDLESS_RESOURCE_TYPE_STORAGE_BUFFER:
+        return SLANGC_RESOURCE_OBJECT_STORAGE_BUFFER;
+    case slang::SLANG_BINDLESS_RESOURCE_TYPE_UNIFORM_BUFFER:
+        return SLANGC_RESOURCE_OBJECT_UNIFORM_BUFFER;
+    default:
+        return SLANGC_RESOURCE_OBJECT_UNKNOWN;
+    }
+}
+
+static int toC99ArraySize(size_t arraySize)
+{
+    if (arraySize == 0)
+        return 0;
+
+    if (arraySize == SLANG_UNBOUNDED_SIZE || arraySize == SLANG_UNKNOWN_SIZE ||
+        arraySize > size_t(std::numeric_limits<int>::max()))
+    {
+        return -1;
+    }
+
+    return int(arraySize);
+}
+
+static void clearResourceInfo(SlangcResourceInfo* outInfo)
+{
+    outInfo->name = nullptr;
+    outInfo->typeName = nullptr;
+    outInfo->set = -1;
+    outInfo->binding = -1;
+    outInfo->bindlessIndex = -1;
+    outInfo->objectType = SLANGC_RESOURCE_OBJECT_UNKNOWN;
+    outInfo->isArray = 0;
+    outInfo->arraySize = 0;
+    outInfo->access = SLANGC_ACCESS_READ;
+}
+
+static void copyResourceInfo(const ResourceInfoStorage& info, SlangcResourceInfo* outInfo)
+{
+    outInfo->name = info.name.c_str();
+    outInfo->typeName = info.typeName.c_str();
+    outInfo->set = info.set;
+    outInfo->binding = info.binding;
+    outInfo->bindlessIndex = info.bindlessIndex;
+    outInfo->objectType = info.objectType;
+    outInfo->isArray = info.isArray;
+    outInfo->arraySize = info.arraySize;
+    outInfo->access = info.access;
+}
+
+static SlangcResourceObjectType classifyResourceObjectType(slang::TypeReflection* type)
+{
+    if (!type)
+        return SLANGC_RESOURCE_OBJECT_UNKNOWN;
+
+    while (type->isArray())
+        type = type->getElementType();
+
+    if (!type)
+        return SLANGC_RESOURCE_OBJECT_UNKNOWN;
+
+    auto kind = type->getKind();
+    if (kind == slang::TypeReflection::Kind::SamplerState)
+        return SLANGC_RESOURCE_OBJECT_SAMPLER;
+
+    if (kind == slang::TypeReflection::Kind::ConstantBuffer ||
+        kind == slang::TypeReflection::Kind::ParameterBlock)
+    {
+        return SLANGC_RESOURCE_OBJECT_UNIFORM_BUFFER;
+    }
+
+    if (kind == slang::TypeReflection::Kind::ShaderStorageBuffer)
+        return SLANGC_RESOURCE_OBJECT_STORAGE_BUFFER;
+
+    if (kind != slang::TypeReflection::Kind::Resource &&
+        kind != slang::TypeReflection::Kind::TextureBuffer)
+    {
+        return SLANGC_RESOURCE_OBJECT_UNKNOWN;
+    }
+
+    auto shape = type->getResourceShape();
+    if (shape & SLANG_TEXTURE_COMBINED_FLAG)
+        return SLANGC_RESOURCE_OBJECT_COMBINED_TEXTURE_SAMPLER;
+
+    switch (shape & SLANG_RESOURCE_BASE_SHAPE_MASK)
+    {
+    case SLANG_ACCELERATION_STRUCTURE:
+        return SLANGC_RESOURCE_OBJECT_ACCELERATION_STRUCTURE;
+    case SLANG_STRUCTURED_BUFFER:
+    case SLANG_BYTE_ADDRESS_BUFFER:
+        return SLANGC_RESOURCE_OBJECT_STORAGE_BUFFER;
+    default:
+        break;
+    }
+
+    auto access = type->getResourceAccess();
+    if (access == SLANG_RESOURCE_ACCESS_READ)
+        return SLANGC_RESOURCE_OBJECT_SAMPLED_IMAGE;
+    if (access == SLANG_RESOURCE_ACCESS_NONE && kind == slang::TypeReflection::Kind::Resource)
+        return SLANGC_RESOURCE_OBJECT_SAMPLED_IMAGE;
+    return SLANGC_RESOURCE_OBJECT_STORAGE_IMAGE;
+}
+
+static const char* defaultTypeNameForObjectType(SlangcResourceObjectType objectType)
+{
+    switch (objectType)
+    {
+    case SLANGC_RESOURCE_OBJECT_COMBINED_TEXTURE_SAMPLER:
+        return "CombinedTextureSampler";
+    case SLANGC_RESOURCE_OBJECT_SAMPLER:
+        return "SamplerState";
+    case SLANGC_RESOURCE_OBJECT_STORAGE_IMAGE:
+        return "Texture";
+    case SLANGC_RESOURCE_OBJECT_SAMPLED_IMAGE:
+        return "Texture";
+    case SLANGC_RESOURCE_OBJECT_STORAGE_BUFFER:
+        return "StorageBuffer";
+    case SLANGC_RESOURCE_OBJECT_UNIFORM_BUFFER:
+        return "ConstantBuffer";
+    case SLANGC_RESOURCE_OBJECT_ACCELERATION_STRUCTURE:
+        return "RaytracingAccelerationStructure";
+    default:
+        return "Resource";
+    }
+}
+
+static int combineArraySize(int lhs, int rhs)
+{
+    if (lhs == -1 || rhs == -1)
+        return -1;
+    if (lhs == 0)
+        return rhs;
+    if (rhs == 0)
+        return lhs;
+
+    long long combinedSize = static_cast<long long>(lhs) * static_cast<long long>(rhs);
+    if (combinedSize > std::numeric_limits<int>::max())
+        return -1;
+    return int(combinedSize);
 }
 
 // Wrapper callback that handles caching
@@ -418,6 +574,7 @@ void SlangcCompilerImpl::ensureSession()
     addIntOption(slang::CompilerOptionName::MatrixLayoutRow,     1);
     addIntOption(slang::CompilerOptionName::EnableRichDiagnostics,     1);
     addIntOption(slang::CompilerOptionName::EnableMachineReadableDiagnostics,     1);
+    addIntOption(slang::CompilerOptionName::VulkanUseEntryPointName,     1);
 
     sessionDesc.compilerOptionEntries = compilerOptions.data();
     sessionDesc.compilerOptionEntryCount = static_cast<uint32_t>(compilerOptions.size());
@@ -705,6 +862,45 @@ SLANGC_API SlangcModule slangc_loadModuleFromFile(SlangcCompiler compiler, const
     return module;
 }
 
+SLANGC_API int slangc_getModuleDependencyFileCount(SlangcModule module)
+{
+    auto slangModule = static_cast<slang::IModule*>(module);
+    auto internalModule = static_cast<Slang::Module*>(slangModule);
+    if (!internalModule)
+        return 0;
+
+    int count = 0;
+    for (auto sourceFile : internalModule->getFileDependencies())
+    {
+        if (sourceFile->getPathInfo().hasFileFoundPath())
+            ++count;
+    }
+    return count;
+}
+
+SLANGC_API const char* slangc_getModuleDependencyFilePath(SlangcModule module, int index)
+{
+    auto slangModule = static_cast<slang::IModule*>(module);
+    auto internalModule = static_cast<Slang::Module*>(slangModule);
+    if (!internalModule || index < 0)
+        return nullptr;
+
+    int fileIndex = 0;
+    for (auto sourceFile : internalModule->getFileDependencies())
+    {
+        const auto& pathInfo = sourceFile->getPathInfo();
+        if (!pathInfo.hasFileFoundPath())
+            continue;
+
+        if (fileIndex == index)
+            return pathInfo.foundPath.getBuffer();
+
+        ++fileIndex;
+    }
+
+    return nullptr;
+}
+
 /*
  * Program creation and configuration
  */
@@ -934,7 +1130,6 @@ SLANGC_API int slangc_link(SlangcProgram program)
         };
 
         std::vector<slang::SpecializationArg> specArgs;
-        std::unordered_set<std::string> matchedNamedArgs;
         for (SlangInt i = 0; i < paramCount; i++)
         {
             auto& param = componentType->getSpecializationParam(i);
@@ -946,7 +1141,7 @@ SLANGC_API int slangc_link(SlangcProgram program)
             const char* paramName = nullptr;
             if (param.flavor == SpecializationParam::Flavor::GenericType)
             {
-                if (auto typeParam = as<GenericTypeParamDecl>(param.object))
+                if (auto typeParam = as<GenericTypeParamDeclBase>(param.object))
                     paramName = typeParam->getName() ? typeParam->getName()->text.getBuffer() : nullptr;
                 else if (auto globalTypeParam = as<GlobalGenericParamDecl>(param.object))
                     paramName = globalTypeParam->getName() ? globalTypeParam->getName()->text.getBuffer() : nullptr;
@@ -971,20 +1166,10 @@ SLANGC_API int slangc_link(SlangcProgram program)
                 {
                     arg.kind = slang::SpecializationArg::Kind::Expr;
                     arg.expr = it->second.c_str();
-                    matchedNamedArgs.insert(it->first);
                 }
             }
 
             specArgs.push_back(arg);
-        }
-
-        for (const auto& it : impl->namedSpecializationArgs)
-        {
-            if (matchedNamedArgs.find(it.first) == matchedNamedArgs.end())
-            {
-                impl->appendError(("Unknown specialization parameter: " + it.first).c_str());
-                return 0;
-            }
         }
 
         ComPtr<slang::IComponentType> specializedProgram;
@@ -1101,8 +1286,9 @@ SLANGC_API int slangc_link(SlangcProgram program)
     impl->appendDiagnostics(diagnostics);
 
     // Helper lambda to recursively collect resources from a type layout
-    std::function<void(slang::VariableLayoutReflection*, const std::string&)> collectResources;
-    collectResources = [&](slang::VariableLayoutReflection* varLayout, const std::string& prefix)
+    std::function<void(slang::VariableLayoutReflection*, const std::string&, int)> collectResources;
+    collectResources =
+        [&](slang::VariableLayoutReflection* varLayout, const std::string& prefix, int inheritedArraySize)
     {
         if (!varLayout)
             return;
@@ -1111,7 +1297,13 @@ SLANGC_API int slangc_link(SlangcProgram program)
         if (!typeLayout)
             return;
 
-        auto type = typeLayout->getType();
+        int localArraySize = 0;
+        if (typeLayout->isArray())
+            localArraySize = toC99ArraySize(typeLayout->getTotalArrayElementCount());
+
+        auto effectiveArraySize = combineArraySize(inheritedArraySize, localArraySize);
+        auto leafTypeLayout = typeLayout->isArray() ? typeLayout->unwrapArray() : typeLayout;
+        auto type = leafTypeLayout ? leafTypeLayout->getType() : nullptr;
         if (!type)
             return;
 
@@ -1120,10 +1312,10 @@ SLANGC_API int slangc_link(SlangcProgram program)
         // If this is a struct, recurse into its fields
         if (kind == slang::TypeReflection::Kind::Struct)
         {
-            unsigned fieldCount = typeLayout->getFieldCount();
+            unsigned fieldCount = leafTypeLayout->getFieldCount();
             for (unsigned f = 0; f < fieldCount; f++)
             {
-                auto fieldLayout = typeLayout->getFieldByIndex(f);
+                auto fieldLayout = leafTypeLayout->getFieldByIndex(f);
                 if (!fieldLayout)
                     continue;
 
@@ -1132,7 +1324,7 @@ SLANGC_API int slangc_link(SlangcProgram program)
                     continue;
 
                 // Use just the field name for struct members (leaf name only)
-                collectResources(fieldLayout, fieldName);
+                collectResources(fieldLayout, fieldName, effectiveArraySize);
             }
             return;
         }
@@ -1144,32 +1336,25 @@ SLANGC_API int slangc_link(SlangcProgram program)
         info.set = -1;
         info.binding = -1;
         info.bindlessIndex = -1;
+        info.objectType = classifyResourceObjectType(type);
+        info.isArray = effectiveArraySize != 0 ? 1 : 0;
+        info.arraySize = effectiveArraySize;
         info.access = SLANGC_ACCESS_READ;  // Default to read-only
 
         // Determine type name and access
-        switch (kind)
-        {
-        case slang::TypeReflection::Kind::SamplerState:
-            info.typeName = "SamplerState";
-            break;
-        case slang::TypeReflection::Kind::Resource:
-            info.typeName = "Texture";
-            break;
-        case slang::TypeReflection::Kind::ConstantBuffer:
-            info.typeName = "ConstantBuffer";
-            break;
-        case slang::TypeReflection::Kind::ShaderStorageBuffer:
-            info.typeName = "StorageBuffer";
-            break;
-        default:
-            break;
-        }
+        const char* typeName = type->getName();
+        info.typeName = typeName ? typeName : defaultTypeNameForObjectType(info.objectType);
+
+        auto resourceAccess = type->getResourceAccess();
+        if (resourceAccess != SLANG_RESOURCE_ACCESS_NONE)
+            info.access = toC99Access(resourceAccess);
 
         // Get binding info and determine access from category
         auto category = varLayout->getCategory();
         if (category == slang::ParameterCategory::DescriptorTableSlot ||
             category == slang::ParameterCategory::ShaderResource ||
             category == slang::ParameterCategory::UnorderedAccess ||
+            category == slang::ParameterCategory::ConstantBuffer ||
             category == slang::ParameterCategory::SamplerState)
         {
             info.set = (int)varLayout->getBindingSpace(category);
@@ -1200,7 +1385,7 @@ SLANGC_API int slangc_link(SlangcProgram program)
             if (!name)
                 continue;
 
-            collectResources(param, name);
+            collectResources(param, name, 0);
         }
     }
 
@@ -1220,9 +1405,12 @@ SLANGC_API int slangc_link(SlangcProgram program)
                 ResourceInfoStorage info;
                 info.name = std::string(res.name.begin(), res.name.end());
                 info.typeName = std::string(res.typeName.begin(), res.typeName.end());
-                info.set = -1;
-                info.binding = -1;
+                info.set = (int)res.set;
+                info.binding = (int)res.binding;
                 info.bindlessIndex = (int)res.index;
+                info.objectType = toC99ObjectType(res.resourceType);
+                info.isArray = res.isArray ? 1 : 0;
+                info.arraySize = (int)res.arraySize;
                 info.access = toC99Access(res.access);
                 impl->bindlessResources.push_back(info);
             }
@@ -1297,22 +1485,11 @@ SLANGC_API int slangc_getResource(SlangcProgram program, int index, SlangcResour
     auto impl = static_cast<SlangcProgramImpl*>(program);
     if (!impl || index < 0 || index >= (int)impl->resources.size())
     {
-        outInfo->name = nullptr;
-        outInfo->typeName = nullptr;
-        outInfo->set = -1;
-        outInfo->binding = -1;
-        outInfo->bindlessIndex = -1;
-        outInfo->access = SLANGC_ACCESS_READ;
+        clearResourceInfo(outInfo);
         return 0;
     }
 
-    const auto& info = impl->resources[index];
-    outInfo->name = info.name.c_str();
-    outInfo->typeName = info.typeName.c_str();
-    outInfo->set = info.set;
-    outInfo->binding = info.binding;
-    outInfo->bindlessIndex = info.bindlessIndex;
-    outInfo->access = info.access;
+    copyResourceInfo(impl->resources[index], outInfo);
     return 1;
 }
 
@@ -1330,22 +1507,11 @@ SLANGC_API int slangc_getBindlessResource(SlangcProgram program, int index, Slan
     auto impl = static_cast<SlangcProgramImpl*>(program);
     if (!impl || index < 0 || index >= (int)impl->bindlessResources.size())
     {
-        outInfo->name = nullptr;
-        outInfo->typeName = nullptr;
-        outInfo->set = -1;
-        outInfo->binding = -1;
-        outInfo->bindlessIndex = -1;
-        outInfo->access = SLANGC_ACCESS_READ;
+        clearResourceInfo(outInfo);
         return 0;
     }
 
-    const auto& info = impl->bindlessResources[index];
-    outInfo->name = info.name.c_str();
-    outInfo->typeName = info.typeName.c_str();
-    outInfo->set = info.set;
-    outInfo->binding = info.binding;
-    outInfo->bindlessIndex = info.bindlessIndex;
-    outInfo->access = info.access;
+    copyResourceInfo(impl->bindlessResources[index], outInfo);
     return 1;
 }
 
@@ -1363,22 +1529,11 @@ SLANGC_API int slangc_getUnmappedResource(SlangcProgram program, int index, Slan
     auto impl = static_cast<SlangcProgramImpl*>(program);
     if (!impl || index < 0 || index >= (int)impl->unmappedResources.size())
     {
-        outInfo->name = nullptr;
-        outInfo->typeName = nullptr;
-        outInfo->set = -1;
-        outInfo->binding = -1;
-        outInfo->bindlessIndex = -1;
-        outInfo->access = SLANGC_ACCESS_READ;
+        clearResourceInfo(outInfo);
         return 0;
     }
 
-    const auto& info = impl->unmappedResources[index];
-    outInfo->name = info.name.c_str();
-    outInfo->typeName = info.typeName.c_str();
-    outInfo->set = info.set;
-    outInfo->binding = info.binding;
-    outInfo->bindlessIndex = info.bindlessIndex;
-    outInfo->access = info.access;
+    copyResourceInfo(impl->unmappedResources[index], outInfo);
     return 1;
 }
 
