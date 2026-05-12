@@ -7346,14 +7346,6 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 SpvDecorationPatch);
             break;
         }
-        if (isPerPrimitive)
-        {
-            emitOpDecorate(
-                getSection(SpvLogicalSectionID::Annotations),
-                nullptr,
-                varInst,
-                SpvDecorationPerPrimitiveEXT);
-        }
         m_builtinGlobalVars[key] = varInst;
 
         if (isFlat)

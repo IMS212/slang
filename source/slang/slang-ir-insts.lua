@@ -3198,7 +3198,30 @@ local function process(insts)
 	end
 
 	-- Load stable names if file is provided
-	local name_to_stable_name = loadfile(stable_names_file)()
+	if type(loadfile) ~= "function" then
+		error("Lua global 'loadfile' is not available while loading " .. stable_names_file, 0)
+	end
+	local stable_names_chunk, stable_names_load_error = loadfile(stable_names_file)
+	if not stable_names_chunk then
+		error(
+			"failed to load IR stable names from "
+				.. stable_names_file
+				.. ": "
+				.. tostring(stable_names_load_error),
+			0
+		)
+	end
+	local name_to_stable_name = stable_names_chunk()
+	if type(name_to_stable_name) ~= "table" then
+		error(
+			"IR stable names file "
+				.. stable_names_file
+				.. " returned "
+				.. type(name_to_stable_name)
+				.. ", expected table",
+			0
+		)
+	end
 	local stable_name_to_inst = {}
 	local max_stable_name = 0
 

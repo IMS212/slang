@@ -829,6 +829,6 @@ return {
 	["assumeAddress"] = 853,
 	["DebugCompilationUnit"] = 854,
 	["IncrementCoverageCounter"] = 855,
-	["SubpassLoad"] = 856
+	["SubpassLoad"] = 856,
 	["Decoration.HasExplicitVulkanBinding"] = 857,
 }

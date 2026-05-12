@@ -4292,7 +4292,7 @@ err(
 
 err(
     "target-does-not-support-descriptor-handle",
-    39030,
+    60001,
     "target does not support 'DescriptorHandle' types",
     span { loc = "location", message = "the current compilation target does not support 'DescriptorHandle' types." }
 )
@@ -5333,7 +5333,7 @@ fatal(
 
 err(
     "class-type-not-supported",
-    39031,
+    99234,
     "class types are not supported in type layout",
     span { loc = "location", message = "class type '~name' is not supported; use 'struct' instead" }
 )
