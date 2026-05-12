@@ -1658,6 +1658,76 @@ struct LoweredElementTypeContext
             bool shouldWrapArrayInStruct = false;
         };
         List<BufferTypeInfo> bufferTypeInsts;
+        auto typeNeedsStorageLoweringForSPIRV =
+            [&](auto&& self, IRType* type) -> bool
+        {
+            type = (IRType*)unwrapAttributedType(type);
+            if (!type)
+                return false;
+            if (as<IRBoolType>(type))
+                return true;
+            if (auto vectorType = as<IRVectorType>(type))
+                return self(self, vectorType->getElementType());
+            if (auto matrixType = as<IRMatrixType>(type))
+                return self(self, matrixType->getElementType());
+            if (auto arrayType = as<IRArrayTypeBase>(type))
+                return self(self, arrayType->getElementType());
+            if (auto structType = as<IRStructType>(type))
+            {
+                for (auto field : structType->getFields())
+                {
+                    if (self(self, field->getFieldType()))
+                        return true;
+                }
+            }
+            return false;
+        };
+        auto getExternalArrayValueType = [&](IRPtrTypeBase* ptrType) -> IRType*
+        {
+            if (!ptrType)
+                return nullptr;
+            switch (ptrType->getAddressSpace())
+            {
+            case AddressSpace::Uniform:
+            case AddressSpace::StorageBuffer:
+                {
+                    auto valueType = (IRType*)unwrapAttributedType(ptrType->getValueType());
+                    if (auto arrayType = as<IRArrayTypeBase>(valueType))
+                    {
+                        auto elementType =
+                            (IRType*)unwrapAttributedType(arrayType->getElementType());
+                        if (elementType &&
+                            elementType->findDecoration<IRPhysicalTypeDecoration>() &&
+                            !typeNeedsStorageLoweringForSPIRV(
+                                typeNeedsStorageLoweringForSPIRV,
+                                elementType))
+                        {
+                            return nullptr;
+                        }
+                    }
+                    return as<IRArrayTypeBase>(valueType) ? valueType : nullptr;
+                }
+            default:
+                return nullptr;
+            }
+        };
+        auto addBufferTypeInfo = [&](IRType* bufferType, IRType* elementType)
+        {
+            if (!elementType)
+                return;
+            elementType = (IRType*)unwrapAttributedType(elementType);
+            if (as<IRTextureBufferType>(bufferType))
+                return;
+            if (!as<IRStructType>(elementType) && !as<IRMatrixType>(elementType) &&
+                !as<IRArrayType>(elementType) && !as<IRBoolType>(elementType))
+                return;
+            for (auto& bufferTypeInfo : bufferTypeInsts)
+            {
+                if (bufferTypeInfo.bufferType == bufferType)
+                    return;
+            }
+            bufferTypeInsts.add(BufferTypeInfo{bufferType, elementType});
+        };
         for (auto globalInst : module->getGlobalInsts())
         {
             IRType* elementType = nullptr;
@@ -1670,6 +1740,12 @@ struct LoweredElementTypeContext
                 case AddressSpace::Input:
                 case AddressSpace::Output:
                     elementType = ptrType->getValueType();
+                    break;
+                case AddressSpace::Uniform:
+                case AddressSpace::StorageBuffer:
+                    elementType = getExternalArrayValueType(ptrType);
+                    break;
+                default:
                     break;
                 }
             }
@@ -1693,12 +1769,17 @@ struct LoweredElementTypeContext
             else if (auto storageBuffer = as<IRGLSLShaderStorageBufferType>(globalInst))
                 elementType = storageBuffer->getElementType();
 
-            if (as<IRTextureBufferType>(globalInst))
-                continue;
-            if (!as<IRStructType>(elementType) && !as<IRMatrixType>(elementType) &&
-                !as<IRArrayType>(elementType) && !as<IRBoolType>(elementType))
-                continue;
-            bufferTypeInsts.add(BufferTypeInfo{(IRType*)globalInst, elementType});
+            addBufferTypeInfo((IRType*)globalInst, elementType);
+
+            if (as<IRGlobalParam>(globalInst) || as<IRGlobalVar>(globalInst))
+            {
+                if (auto ptrType =
+                        as<IRPtrTypeBase>((IRType*)unwrapAttributedType(globalInst->getDataType())))
+                {
+                    if (auto elementType = getExternalArrayValueType(ptrType))
+                        addBufferTypeInfo(ptrType, elementType);
+                }
+            }
         }
 
 
@@ -2449,6 +2530,14 @@ TypeLoweringConfig getTypeLoweringConfigForBuffer(TargetProgram* target, IRType*
             break;
         case AddressSpace::UserPointer:
             addrSpace = AddressSpace::UserPointer;
+            break;
+        case AddressSpace::Uniform:
+            addrSpace = AddressSpace::Uniform;
+            break;
+        case AddressSpace::StorageBuffer:
+            addrSpace = AddressSpace::StorageBuffer;
+            break;
+        default:
             break;
         }
     }

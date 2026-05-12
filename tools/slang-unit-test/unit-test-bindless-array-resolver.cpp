@@ -267,3 +267,89 @@ SLANG_UNIT_TEST(bindlessArrayScalarConflictWarning)
     SLANG_CHECK(strstr(diagnosticText, "only a scalar bindless binding exists") != nullptr);
 }
 
+SLANG_UNIT_TEST(bindlessBufferBoolElementsUseStorageTypes)
+{
+    const char* source = R"(
+        struct Settings
+        {
+            bool enabled;
+            uint value;
+        };
+
+        ConstantBuffer<Settings> settings;
+        StructuredBuffer<Settings> entries;
+        RWStructuredBuffer<Settings> rwEntries;
+        RWStructuredBuffer<uint> output;
+
+        [shader("compute")]
+        [numthreads(1, 1, 1)]
+        void computeMain(uint3 tid : SV_DispatchThreadID)
+        {
+            Settings entry = entries[0];
+            Settings rwEntry = rwEntries[0];
+            output[0] = (settings.enabled && entry.enabled && rwEntry.enabled)
+                ? settings.value + entry.value + rwEntry.value
+                : 0;
+        }
+    )";
+
+    ComPtr<slang::IGlobalSession> globalSession;
+    SLANG_CHECK(slang_createGlobalSession(SLANG_API_VERSION, globalSession.writeRef()) == SLANG_OK);
+
+    slang::TargetDesc targetDesc = {};
+    targetDesc.format = SLANG_SPIRV_ASM;
+    targetDesc.profile = globalSession->findProfile("spirv_1_5");
+
+    slang::SessionDesc sessionDesc = {};
+    sessionDesc.targetCount = 1;
+    sessionDesc.targets = &targetDesc;
+
+    ComPtr<slang::ISession> session;
+    SLANG_CHECK(globalSession->createSession(sessionDesc, session.writeRef()) == SLANG_OK);
+
+    ComPtr<slang::IBlob> diagnostics;
+    auto module = session->loadModuleFromSourceString(
+        "bindless_buffer_bool",
+        "bindless_buffer_bool.slang",
+        source,
+        diagnostics.writeRef());
+    SLANG_CHECK(module != nullptr);
+
+    ComPtr<slang::IEntryPoint> entryPoint;
+    SLANG_CHECK(module->findEntryPointByName("computeMain", entryPoint.writeRef()) == SLANG_OK);
+    SLANG_CHECK(entryPoint != nullptr);
+
+    ComPtr<slang::IComponentType> compositeProgram;
+    slang::IComponentType* components[] = { module, entryPoint.get() };
+    SLANG_CHECK(
+        session->createCompositeComponentType(
+            components,
+            2,
+            compositeProgram.writeRef(),
+            diagnostics.writeRef()) == SLANG_OK);
+
+    ComPtr<slang::IComponentType> linkedProgram;
+    SLANG_CHECK(compositeProgram->link(linkedProgram.writeRef(), diagnostics.writeRef()) == SLANG_OK);
+
+    ComPtr<slang::IComponentType3> linkedComp3;
+    SLANG_CHECK(SLANG_SUCCEEDED(linkedProgram->queryInterface(
+        slang::IComponentType3::getTypeGuid(),
+        (void**)linkedComp3.writeRef())));
+
+    const char* names[] = { "settings", "entries", "rwEntries" };
+    SlangInt indices[] = { 3, 7, 11 };
+    SLANG_CHECK(linkedComp3->setBindlessResourceIndexMap(0, names, indices, 3) == SLANG_OK);
+
+    ComPtr<slang::IBlob> code;
+    SLANG_CHECK(linkedProgram->getTargetCode(0, code.writeRef(), diagnostics.writeRef()) == SLANG_OK);
+    SLANG_CHECK(code != nullptr);
+
+    const char* codeText = (const char*)code->getBufferPointer();
+    SLANG_CHECK(codeText != nullptr);
+    SLANG_CHECK(strstr(codeText, "__slang_resource_heap") != nullptr);
+    SLANG_CHECK(strstr(codeText, "_runtimearr_Settings = OpTypeRuntimeArray %Settings") == nullptr);
+    SLANG_CHECK(
+        strstr(codeText, "OpVariable %_ptr_Uniform__runtimearr_Settings Uniform") == nullptr);
+    SLANG_CHECK(strstr(codeText, "RWStructuredBuffer_Settings") != nullptr);
+    SLANG_CHECK(strstr(codeText, "Offset 0") != nullptr);
+}

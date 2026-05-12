@@ -87,6 +87,9 @@ struct SlangcCompilerImpl
     SlangcBindlessCombinedSamplerResolverCallback bindlessCombinedSamplerResolver = nullptr;
     void* bindlessCombinedSamplerResolverUserData = nullptr;
 
+    SlangcFragmentOutputResolverCallback fragmentOutputResolver = nullptr;
+    void* fragmentOutputResolverUserData = nullptr;
+
     // Cache for bindless resolver results (resourceName:resourceType -> index)
     // Persists across programs to avoid redundant callback invocations
     Slang::Dictionary<Slang::String, int> bindlessResolverCache;
@@ -148,6 +151,12 @@ struct BindlessCombinedSamplerResolverWrapper
     void* userCallbackData;
 };
 
+struct FragmentOutputResolverWrapper
+{
+    SlangcFragmentOutputResolverCallback userCallback;
+    void* userCallbackData;
+};
+
 struct SlangcProgramImpl
 {
     SlangcCompilerImpl* compiler;  // Back-reference to compiler
@@ -173,6 +182,7 @@ struct SlangcProgramImpl
     std::unique_ptr<BindlessResolverWrapper> resolverWrapper;
     std::unique_ptr<BindlessArrayResolverWrapper> arrayResolverWrapper;
     std::unique_ptr<BindlessCombinedSamplerResolverWrapper> combinedSamplerResolverWrapper;
+    std::unique_ptr<FragmentOutputResolverWrapper> fragmentOutputResolverWrapper;
 
     // Post-link state
     ComPtr<slang::IComponentType> linkedProgram;
@@ -440,6 +450,15 @@ static int bindlessCombinedSamplerResolverWrapperCallback(
         return -1;
 
     return wrapper->userCallback(resourceName, wrapper->userCallbackData);
+}
+
+static int fragmentOutputResolverWrapperCallback(const char* outputName, void* userData)
+{
+    auto* wrapper = static_cast<FragmentOutputResolverWrapper*>(userData);
+    if (!wrapper || !wrapper->userCallback)
+        return -1;
+
+    return wrapper->userCallback(outputName, wrapper->userCallbackData);
 }
 
 //
@@ -995,6 +1014,18 @@ SLANGC_API void slangc_setBindlessCombinedSamplerResolver(
     impl->bindlessCombinedSamplerResolverUserData = userData;
 }
 
+SLANGC_API void slangc_setFragmentOutputResolver(
+    SlangcCompiler compiler,
+    SlangcFragmentOutputResolverCallback callback,
+    void* userData)
+{
+    auto impl = static_cast<SlangcCompilerImpl*>(compiler);
+    if (!impl)
+        return;
+    impl->fragmentOutputResolver = callback;
+    impl->fragmentOutputResolverUserData = userData;
+}
+
 /*
  * Linking
  */
@@ -1271,6 +1302,28 @@ SLANGC_API int slangc_link(SlangcProgram program)
                 bindlessCombinedSamplerResolverWrapperCallback,
                 impl->combinedSamplerResolverWrapper.get());
         }
+    }
+
+    if (compiler->fragmentOutputResolver)
+    {
+        ComPtr<slang::IComponentType6> linkedComp6;
+        if (SLANG_FAILED(linkedProgram->queryInterface(
+                slang::IComponentType6::getTypeGuid(),
+                (void**)linkedComp6.writeRef())))
+        {
+            impl->appendError("Linked program does not support fragment output resolver");
+            return 0;
+        }
+
+        impl->fragmentOutputResolverWrapper = std::make_unique<FragmentOutputResolverWrapper>();
+        impl->fragmentOutputResolverWrapper->userCallback = compiler->fragmentOutputResolver;
+        impl->fragmentOutputResolverWrapper->userCallbackData =
+            compiler->fragmentOutputResolverUserData;
+
+        linkedComp6->setFragmentOutputResolver(
+            0,
+            fragmentOutputResolverWrapperCallback,
+            impl->fragmentOutputResolverWrapper.get());
     }
 
     // Get compiled code

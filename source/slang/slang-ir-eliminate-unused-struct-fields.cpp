@@ -1,6 +1,7 @@
 #include "slang-ir-eliminate-unused-struct-fields.h"
 #include "slang-ir.h"
 #include "slang-ir-insts.h"
+#include "slang-ir-legalize-varying-params.h"
 
 namespace Slang
 {
@@ -38,6 +39,7 @@ namespace Slang
 
         // Phase 3: Collect used varying locations from fragment shader inputs
         void collectUsedVaryingLocations();
+        void collectUsedVaryingLocationsFromValue(IRInst* value, HashSet<IRInst*>& visited);
 
         // Phase 4: Optimize vertex shader outputs
         void optimizeVertexOutputs();
@@ -45,6 +47,8 @@ namespace Slang
         // Helper: Get varying location from layout decoration
         // Returns -1 if not found
         Int getVaryingLocation(IRInst* globalParam, LayoutResourceKind kind);
+
+        bool isSystemValueParam(IRInst* globalParam);
     };
 
     void UnusedFieldEliminationContext::collectMakeStructsInInst(IRInst* inst)
@@ -120,6 +124,18 @@ namespace Slang
                 }
                 // Also follow uses of the field extract result
                 collectUsedFieldsFromUses(user, nullptr, usedFields, visited);
+            }
+            // If a struct value is nested inside another MakeStruct, conservatively
+            // treat all of its fields as used. Otherwise we can incorrectly replace
+            // the nested value with defaults before the outer struct's field use
+            // gets observed, which breaks nested varying payloads like
+            // `RealVertexOutput<T>.surfaceData`.
+            else if (user->getOp() == kIROp_MakeStruct && structType)
+            {
+                for (auto field : structType->getFields())
+                {
+                    usedFields.add(field->getKey());
+                }
             }
             // If the struct value is passed to a function, follow into the function
             else if (auto call = as<IRCall>(user))
@@ -393,6 +409,83 @@ namespace Slang
         return (Int)offsetAttr->getOffset();
     }
 
+    bool UnusedFieldEliminationContext::isSystemValueParam(IRInst* globalParam)
+    {
+        if (auto layoutDecor = globalParam->findDecoration<IRLayoutDecoration>())
+        {
+            if (auto varLayout = as<IRVarLayout>(layoutDecor->getLayout()))
+            {
+                if (varLayout->findSystemValueSemanticAttr())
+                    return true;
+            }
+        }
+
+        if (auto semanticDecor = globalParam->findDecoration<IRSemanticDecoration>())
+        {
+            if (convertSystemValueSemanticNameToEnum(String(semanticDecor->getSemanticName())) !=
+                SystemValueSemanticName::None)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void UnusedFieldEliminationContext::collectUsedVaryingLocationsFromValue(
+        IRInst* value,
+        HashSet<IRInst*>& visited)
+    {
+        if (!value || visited.contains(value))
+            return;
+        visited.add(value);
+
+        switch (value->getOp())
+        {
+        case kIROp_DefaultConstruct:
+        case kIROp_MakeVectorFromScalar:
+            return;
+
+        case kIROp_Load:
+            {
+                auto loadInst = as<IRLoad>(value);
+                auto loadPtr = loadInst->getPtr();
+                auto globalParam = as<IRGlobalParam>(loadPtr);
+                if (!globalParam)
+                    return;
+
+                auto paramType = globalParam->getDataType();
+                if (paramType->getOp() != kIROp_BorrowInParamType)
+                    return;
+
+                if (isSystemValueParam(globalParam) ||
+                    globalParam->findDecoration<IRGLPositionInputDecoration>())
+                {
+                    return;
+                }
+
+                Int location = getVaryingLocation(globalParam, LayoutResourceKind::VaryingInput);
+                if (location >= 0)
+                {
+                    usedVaryingLocations.add((UInt)location);
+                }
+                return;
+            }
+
+        case kIROp_MakeStruct:
+        case kIROp_MakeArray:
+        case kIROp_MakeTuple:
+            for (UInt i = 0; i < value->getOperandCount(); i++)
+            {
+                collectUsedVaryingLocationsFromValue(value->getOperand(i), visited);
+            }
+            return;
+
+        default:
+            return;
+        }
+    }
+
     void UnusedFieldEliminationContext::collectUsedVaryingLocations()
     {
         // After Phase 2, MakeStruct operands that were unused have been replaced with
@@ -420,49 +513,12 @@ namespace Slang
             hasFragmentEntryPoint = true;
 
             // For each operand in the MakeStruct, check if it's a load from a
-            // fragment input global param (vs a default value)
+            // fragment input global param (vs a default value). Nested payloads
+            // are represented as nested MakeStruct values, so recurse.
+            HashSet<IRInst*> visited;
             for (UInt i = 0; i < makeStruct->getOperandCount(); i++)
             {
-                auto operand = makeStruct->getOperand(i);
-
-                // If the operand is a default construct, this field is not used
-                if (operand->getOp() == kIROp_DefaultConstruct ||
-                    operand->getOp() == kIROp_MakeVectorFromScalar)
-                {
-                    continue;
-                }
-
-                // Trace back to find if this operand comes from a load of a
-                // fragment input global param
-                IRInst* source = operand;
-
-                // Handle the case where operand might be a load directly
-                if (source->getOp() == kIROp_Load)
-                {
-                    auto loadInst = as<IRLoad>(source);
-                    auto loadPtr = loadInst->getPtr();
-
-                    auto globalParam = as<IRGlobalParam>(loadPtr);
-                    if (globalParam)
-                    {
-                        // Check if this is a fragment input
-                        auto paramType = globalParam->getDataType();
-                        if (paramType->getOp() == kIROp_BorrowInParamType)
-                        {
-                            // Skip built-in inputs
-                            if (!globalParam->findDecoration<IRGLPositionInputDecoration>())
-                            {
-                                Int location = getVaryingLocation(
-                                    globalParam,
-                                    LayoutResourceKind::VaryingInput);
-                                if (location >= 0)
-                                {
-                                    usedVaryingLocations.add((UInt)location);
-                                }
-                            }
-                        }
-                    }
-                }
+                collectUsedVaryingLocationsFromValue(makeStruct->getOperand(i), visited);
             }
         }
     }
@@ -482,8 +538,12 @@ namespace Slang
             if (paramType->getOp() != kIROp_OutParamType)
                 continue;
 
-            // Skip built-in outputs (like gl_Position)
-            if (globalParam->findDecoration<IRGLPositionOutputDecoration>())
+            // Skip system-value outputs like SV_Position and
+            // SV_RenderTargetArrayIndex. They are not fragment varyings and
+            // must not be defaulted just because the fragment stage doesn't
+            // read a matching location.
+            if (isSystemValueParam(globalParam) ||
+                globalParam->findDecoration<IRGLPositionOutputDecoration>())
                 continue;
 
             // Only process vertex outputs (not fragment outputs which are render targets)

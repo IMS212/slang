@@ -252,6 +252,91 @@ SLANG_UNIT_TEST(linkTimeConditionalReflection)
     SLANG_CHECK(spirvStr.indexOf(toSlice("Location 2")) == -1);
 }
 
+SLANG_UNIT_TEST(fragmentTargetSemanticRespectsSparseLocationOnSPIRV)
+{
+    const char* userSourceBody = R"(
+        struct FragOut
+        {
+            float4 color0 : SV_Target0;
+            float4 color2 : SV_Target2;
+        };
+
+        [shader("fragment")]
+        FragOut fragMain(float2 uv : TEXCOORD0)
+        {
+            FragOut o;
+            o.color0 = float4(uv, 0, 1);
+            o.color2 = float4(0, 0, 1, 1);
+            return o;
+        }
+        )";
+
+    ComPtr<slang::IGlobalSession> globalSession;
+    SLANG_CHECK(slang_createGlobalSession(SLANG_API_VERSION, globalSession.writeRef()) == SLANG_OK);
+    slang::TargetDesc targetDesc = {};
+    targetDesc.format = SLANG_SPIRV_ASM;
+    targetDesc.profile = globalSession->findProfile("spirv_1_5");
+    slang::SessionDesc sessionDesc = {};
+    sessionDesc.targetCount = 1;
+    sessionDesc.targets = &targetDesc;
+    ComPtr<slang::ISession> session;
+    SLANG_CHECK(globalSession->createSession(sessionDesc, session.writeRef()) == SLANG_OK);
+
+    ComPtr<slang::IBlob> diagnosticBlob;
+    auto module = session->loadModuleFromSourceString(
+        "FragmentTargetSemanticRespectsSparseLocationOnSPIRV",
+        "FragmentTargetSemanticRespectsSparseLocationOnSPIRV.slang",
+        userSourceBody,
+        diagnosticBlob.writeRef());
+    SLANG_CHECK_ABORT(module != nullptr);
+
+    ComPtr<slang::IEntryPoint> entryPoint;
+    module->findAndCheckEntryPoint(
+        "fragMain",
+        SLANG_STAGE_FRAGMENT,
+        entryPoint.writeRef(),
+        diagnosticBlob.writeRef());
+    SLANG_CHECK_ABORT(entryPoint != nullptr);
+
+    slang::IComponentType* components[] = {module, entryPoint.get()};
+
+    ComPtr<slang::IComponentType> compositeProgram;
+    session->createCompositeComponentType(
+        components,
+        2,
+        compositeProgram.writeRef(),
+        diagnosticBlob.writeRef());
+    SLANG_CHECK_ABORT(compositeProgram != nullptr);
+
+    ComPtr<slang::IComponentType> linkedProgram;
+    compositeProgram->link(linkedProgram.writeRef(), diagnosticBlob.writeRef());
+    SLANG_CHECK_ABORT(linkedProgram != nullptr);
+
+    auto programLayout = linkedProgram->getLayout();
+    auto entryPointLayout = programLayout->getEntryPointByIndex(0);
+    auto resultLayout = entryPointLayout->getResultVarLayout();
+    SLANG_CHECK_ABORT(resultLayout != nullptr);
+
+    auto resultTypeLayout = resultLayout->getTypeLayout();
+    SLANG_CHECK_ABORT(resultTypeLayout->getFieldCount() == 2);
+    SLANG_CHECK(
+        resultTypeLayout->getFieldByIndex(0)->getOffset(slang::ParameterCategory::VaryingOutput) ==
+        0);
+    SLANG_CHECK(
+        resultTypeLayout->getFieldByIndex(1)->getOffset(slang::ParameterCategory::VaryingOutput) ==
+        2);
+
+    ComPtr<slang::IBlob> codeBlob;
+    linkedProgram->getTargetCode(0, codeBlob.writeRef(), diagnosticBlob.writeRef());
+    SLANG_CHECK_ABORT(codeBlob.get());
+
+    auto spirvStr = UnownedStringSlice((const char*)codeBlob->getBufferPointer());
+    SLANG_CHECK(
+        spirvStr.indexOf(toSlice("OpDecorate %entryPointParam_fragMain_color0 Location 0")) != -1);
+    SLANG_CHECK(
+        spirvStr.indexOf(toSlice("OpDecorate %entryPointParam_fragMain_color2 Location 2")) != -1);
+}
+
 // Test that loading a module that defines an `export` type, but not linking with the module should
 // not affect the type layout.
 

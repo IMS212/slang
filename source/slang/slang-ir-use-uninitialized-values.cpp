@@ -230,7 +230,12 @@ static InstructionUsageType getCallUsageType(IRCall* call, IRInst* inst)
     IRFunc* ftn = nullptr;
     IRFuncType* ftype = nullptr;
     if (auto spec = as<IRSpecialize>(callee))
-        ftn = as<IRFunc>(getResolvedInstForDecorations(spec));
+    {
+        auto resolved = getResolvedInstForDecorations(spec);
+        ftn = as<IRFunc>(resolved);
+        if (!ftn)
+            ftype = as<IRFuncType>(callee->getFullType());
+    }
 
     // Differentiable functions are mostly ignored, treated as having inout parameters
     else if (as<IRForwardDifferentiate>(callee))
@@ -258,6 +263,8 @@ static InstructionUsageType getCallUsageType(IRCall* call, IRInst* inst)
 
     if (ftn)
         ftype = as<IRFuncType>(ftn->getFullType());
+    else if (!ftype)
+        ftype = as<IRFuncType>(callee->getFullType());
 
     if (!ftype)
         return None;

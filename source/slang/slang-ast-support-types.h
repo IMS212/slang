@@ -235,6 +235,9 @@ FIDDLE() namespace Slang
         IDifferentiablePtr,
         NullDifferential,
         OperatorAddressOf,
+        HasSemanticField,
+        TryGetSemanticField,
+        TrySetSemanticField,
         COUNT
     };
 

@@ -20,6 +20,7 @@
 #include "slang-ast-synthesis.h"
 #include "slang-lookup-spirv.h"
 #include "slang-lookup.h"
+#include "slang-parameter-binding.h"
 #include "slang-rich-diagnostics.h"
 
 namespace Slang
@@ -3428,7 +3429,7 @@ Expr* SemanticsExprVisitor::visitInvokeExpr(InvokeExpr* expr)
     auto checkedExpr = CheckInvokeExprWithCheckedOperands(expr);
 
     // Perform additional validation for known built-in functions.
-    maybeCheckKnownBuiltinInvocation(checkedExpr);
+    checkedExpr = maybeCheckKnownBuiltinInvocation(checkedExpr);
 
     if (m_parentDifferentiableAttr)
     {
@@ -5075,46 +5076,378 @@ Expr* SemanticsExprVisitor::visitLambdaExpr(LambdaExpr* lambdaExpr)
     return checkedResultExpr;
 }
 
-void SemanticsExprVisitor::maybeCheckKnownBuiltinInvocation(Expr* invokeExpr)
+namespace
+{
+
+struct SemanticFieldPath
+{
+    List<DeclRef<VarDecl>> fields;
+};
+
+struct SemanticFieldLookupResult
+{
+    int matchCount = 0;
+    SemanticFieldPath path;
+};
+
+static bool _tryGetSemanticNameAndIndex(HLSLSimpleSemantic* semantic, String& outName, int& outIndex)
+{
+    if (!semantic)
+        return false;
+
+    UnownedStringSlice semanticName;
+    UnownedStringSlice semanticDigits;
+    splitNameAndIndex(semantic->name.getContent(), semanticName, semanticDigits);
+
+    outName = semanticName;
+    outIndex = 0;
+    if (semanticDigits.getLength())
+    {
+        Int parsedIndex = 0;
+        if (SLANG_FAILED(StringUtil::parseInt(semanticDigits, parsedIndex)))
+            return false;
+        outIndex = int(parsedIndex);
+    }
+    return true;
+}
+
+static bool _fieldMatchesSemantic(
+    DeclRef<VarDecl> fieldDeclRef,
+    UnownedStringSlice wantedName,
+    int wantedIndex)
+{
+    String fieldSemanticName;
+    int fieldSemanticIndex = 0;
+    if (!_tryGetSemanticNameAndIndex(
+            fieldDeclRef.getDecl()->findModifier<HLSLSimpleSemantic>(),
+            fieldSemanticName,
+            fieldSemanticIndex))
+    {
+        return false;
+    }
+
+    return fieldSemanticIndex == wantedIndex &&
+           fieldSemanticName.getUnownedSlice().caseInsensitiveEquals(wantedName);
+}
+
+static void _findSemanticFieldPathRec(
+    ASTBuilder* astBuilder,
+    Type* type,
+    UnownedStringSlice semanticName,
+    int semanticIndex,
+    int maxMatches,
+    HashSet<Type*>& recursionStack,
+    List<DeclRef<VarDecl>>& ioCurrentPath,
+    SemanticFieldLookupResult& ioResult)
+{
+    if (ioResult.matchCount >= maxMatches)
+        return;
+
+    type = type ? type->getCanonicalType() : nullptr;
+    auto declRefType = as<DeclRefType>(type);
+    if (!declRefType)
+        return;
+
+    auto structDeclRef = declRefType->getDeclRef().as<StructDecl>();
+    if (!structDeclRef)
+        return;
+
+    if (recursionStack.contains(type))
+        return;
+
+    recursionStack.add(type);
+
+    for (auto fieldDeclRef : getFields(astBuilder, structDeclRef, MemberFilterStyle::Instance))
+    {
+        ioCurrentPath.add(fieldDeclRef);
+
+        if (_fieldMatchesSemantic(fieldDeclRef, semanticName, semanticIndex))
+        {
+            if (ioResult.matchCount == 0)
+                ioResult.path.fields = ioCurrentPath;
+            ioResult.matchCount++;
+        }
+
+        if (ioResult.matchCount < maxMatches)
+        {
+            _findSemanticFieldPathRec(
+                astBuilder,
+                getType(astBuilder, DeclRef<VarDeclBase>(fieldDeclRef)),
+                semanticName,
+                semanticIndex,
+                maxMatches,
+                recursionStack,
+                ioCurrentPath,
+                ioResult);
+        }
+
+        ioCurrentPath.removeLast();
+
+        if (ioResult.matchCount >= maxMatches)
+            break;
+    }
+
+    recursionStack.remove(type);
+}
+
+static SemanticFieldLookupResult _findSemanticFieldPath(
+    ASTBuilder* astBuilder,
+    Type* type,
+    UnownedStringSlice semanticName,
+    int semanticIndex,
+    int maxMatches)
+{
+    SemanticFieldLookupResult result;
+    HashSet<Type*> recursionStack;
+    List<DeclRef<VarDecl>> currentPath;
+    _findSemanticFieldPathRec(
+        astBuilder,
+        type,
+        semanticName,
+        semanticIndex,
+        maxMatches,
+        recursionStack,
+        currentPath,
+        result);
+    return result;
+}
+
+static Expr* _createCheckedBoolLiteralExpr(
+    ASTBuilder* astBuilder,
+    SourceLoc loc,
+    bool value)
+{
+    auto result = astBuilder->create<BoolLiteralExpr>();
+    result->loc = loc;
+    result->type = astBuilder->getBoolType();
+    result->checked = true;
+    result->value = value;
+    return result;
+}
+
+static Expr* _createSemanticFieldAccessExpr(
+    ASTBuilder* astBuilder,
+    Expr* baseExpr,
+    SourceLoc loc,
+    const SemanticFieldPath& path)
+{
+    ASTSynthesizer synth(astBuilder, astBuilder->getNamePool());
+    Expr* result = baseExpr;
+    for (auto fieldDeclRef : path.fields)
+    {
+        result = synth.emitMemberExpr(result, fieldDeclRef.getDecl()->getName());
+        result->loc = loc;
+    }
+    return result;
+}
+
+static bool _tryGetStringLiteralArgument(Expr* expr, UnownedStringSlice& outValue)
+{
+    if (auto stringLiteralExpr = as<StringLiteralExpr>(expr))
+    {
+        outValue = stringLiteralExpr->value.getUnownedSlice();
+        return true;
+    }
+    return false;
+}
+
+static bool _tryGetConstantSemanticIndex(
+    SemanticsExprVisitor* visitor,
+    Expr* expr,
+    int& outIndex)
+{
+    auto intVal = as<ConstantIntVal>(visitor->CheckIntegerConstantExpression(
+        expr,
+        SemanticsVisitor::IntegerConstantExpressionCoercionType::AnyInteger,
+        nullptr,
+        SemanticsVisitor::ConstantFoldingKind::CompileTime));
+    if (!intVal)
+        return false;
+
+    outIndex = int(intVal->getValue());
+    return true;
+}
+
+} // namespace
+
+Expr* SemanticsExprVisitor::maybeCheckKnownBuiltinInvocation(Expr* invokeExpr)
 {
     auto checkedInvokeExpr = as<InvokeExpr>(invokeExpr);
     if (!checkedInvokeExpr)
-        return;
+        return invokeExpr;
     auto declRefFuncExpr = as<DeclRefExpr>(checkedInvokeExpr->functionExpr);
     if (!declRefFuncExpr)
-        return;
+        return invokeExpr;
     auto callee = declRefFuncExpr->declRef.getDecl();
     if (!callee)
-        return;
+        return invokeExpr;
     auto knownBuiltinAttr = callee->findModifier<KnownBuiltinAttribute>();
     if (!knownBuiltinAttr)
-        return;
+        return invokeExpr;
     if (auto constantIntVal = as<ConstantIntVal>(knownBuiltinAttr->name))
     {
-        if (constantIntVal->getValue() == (int)KnownBuiltinDeclName::GetAttributeAtVertex)
+        switch (KnownBuiltinDeclName(constantIntVal->getValue()))
         {
-            if (checkedInvokeExpr->arguments.getCount() != 2)
-                return;
-            auto vertexAttributeArg = checkedInvokeExpr->arguments[0];
-            auto vertexAttributeArgDeclRefExpr = as<DeclRefExpr>(vertexAttributeArg);
-            if (!vertexAttributeArgDeclRefExpr)
+        case KnownBuiltinDeclName::GetAttributeAtVertex:
             {
-                getSink()->diagnose(Diagnostics::GetAttributeAtVertexMustReferToPerVertexInput{
-                    .location = invokeExpr->loc});
-                return;
+                if (checkedInvokeExpr->arguments.getCount() != 2)
+                    return invokeExpr;
+                auto vertexAttributeArg = checkedInvokeExpr->arguments[0];
+                auto vertexAttributeArgDeclRefExpr = as<DeclRefExpr>(vertexAttributeArg);
+                if (!vertexAttributeArgDeclRefExpr)
+                {
+                    getSink()->diagnose(Diagnostics::GetAttributeAtVertexMustReferToPerVertexInput{
+                        .location = invokeExpr->loc});
+                    return invokeExpr;
+                }
+                auto vertexAttributeArgDecl = vertexAttributeArgDeclRefExpr->declRef.getDecl();
+                if (!vertexAttributeArgDecl)
+                    return invokeExpr;
+                if (!vertexAttributeArgDecl->findModifier<PerVertexModifier>() &&
+                    !vertexAttributeArgDecl->findModifier<HLSLNoInterpolationModifier>())
+                {
+                    getSink()->diagnose(Diagnostics::GetAttributeAtVertexMustReferToPerVertexInput{
+                        .location = vertexAttributeArgDeclRefExpr->loc});
+                    return invokeExpr;
+                }
+                return invokeExpr;
             }
-            auto vertexAttributeArgDecl = vertexAttributeArgDeclRefExpr->declRef.getDecl();
-            if (!vertexAttributeArgDecl)
-                return;
-            if (!vertexAttributeArgDecl->findModifier<PerVertexModifier>() &&
-                !vertexAttributeArgDecl->findModifier<HLSLNoInterpolationModifier>())
+
+        case KnownBuiltinDeclName::HasSemanticField:
+        case KnownBuiltinDeclName::TryGetSemanticField:
+        case KnownBuiltinDeclName::TrySetSemanticField:
             {
-                getSink()->diagnose(Diagnostics::GetAttributeAtVertexMustReferToPerVertexInput{
-                    .location = vertexAttributeArgDeclRefExpr->loc});
-                return;
+                auto builtinName = KnownBuiltinDeclName(constantIntVal->getValue());
+                const Index argCount = checkedInvokeExpr->arguments.getCount();
+                Index valueArgIndex = 0;
+                Index semanticNameArgIndex = 1;
+                Index semanticIndexArgIndex = Index(-1);
+                Index resultOrValueArgIndex = Index(-1);
+
+                switch (builtinName)
+                {
+                case KnownBuiltinDeclName::HasSemanticField:
+                    if (argCount != 2 && argCount != 3)
+                        return invokeExpr;
+                    if (argCount == 3)
+                        semanticIndexArgIndex = 2;
+                    break;
+
+                case KnownBuiltinDeclName::TryGetSemanticField:
+                    if (argCount != 3 && argCount != 4)
+                        return invokeExpr;
+                    resultOrValueArgIndex = argCount - 1;
+                    if (argCount == 4)
+                        semanticIndexArgIndex = 2;
+                    break;
+
+                case KnownBuiltinDeclName::TrySetSemanticField:
+                    if (argCount != 3 && argCount != 4)
+                        return invokeExpr;
+                    resultOrValueArgIndex = argCount - 1;
+                    if (argCount == 4)
+                        semanticIndexArgIndex = 2;
+                    break;
+
+                default:
+                    break;
+                }
+
+                UnownedStringSlice semanticName;
+                if (!_tryGetStringLiteralArgument(
+                        checkedInvokeExpr->arguments[semanticNameArgIndex],
+                        semanticName))
+                {
+                    getSink()->diagnose(Diagnostics::ExpectedAStringLiteral{
+                        .expr = checkedInvokeExpr->arguments[semanticNameArgIndex]});
+                    return CreateErrorExpr(checkedInvokeExpr);
+                }
+
+                int semanticIndex = 0;
+                if (semanticIndexArgIndex != Index(-1) &&
+                    !_tryGetConstantSemanticIndex(
+                        this,
+                        checkedInvokeExpr->arguments[semanticIndexArgIndex],
+                        semanticIndex))
+                {
+                    return CreateErrorExpr(checkedInvokeExpr);
+                }
+
+                auto valueType = checkedInvokeExpr->arguments[valueArgIndex]->type.type;
+                valueType = valueType ? valueType->getCanonicalType() : nullptr;
+                auto declRefType = as<DeclRefType>(valueType);
+                auto structDeclRef = declRefType ? declRefType->getDeclRef().as<StructDecl>()
+                                                 : DeclRef<StructDecl>();
+                if (!structDeclRef)
+                {
+                    // Generic callers need to survive semantic checking so the lookup can be
+                    // resolved after specialization when `T` becomes concrete.
+                    return invokeExpr;
+                }
+
+                auto lookup = _findSemanticFieldPath(
+                    m_astBuilder,
+                    valueType,
+                    semanticName,
+                    semanticIndex,
+                    builtinName == KnownBuiltinDeclName::HasSemanticField ? 1 : 2);
+
+                if (builtinName == KnownBuiltinDeclName::HasSemanticField)
+                {
+                    return _createCheckedBoolLiteralExpr(
+                        m_astBuilder,
+                        checkedInvokeExpr->loc,
+                        lookup.matchCount != 0);
+                }
+
+                if (lookup.matchCount == 0)
+                {
+                    return _createCheckedBoolLiteralExpr(m_astBuilder, checkedInvokeExpr->loc, false);
+                }
+
+                if (lookup.matchCount > 1)
+                {
+                    getSink()->diagnose(Diagnostics::SemanticFieldLookupAmbiguous{
+                        .location = checkedInvokeExpr->loc,
+                        .semanticName = semanticName,
+                        .semanticIndex = semanticIndex,
+                        .type = checkedInvokeExpr->arguments[valueArgIndex]->type.type});
+                    return CreateErrorExpr(checkedInvokeExpr);
+                }
+
+                Expr* assignment = nullptr;
+                {
+                    ASTSynthesizer synth(m_astBuilder, getNamePool());
+                    auto fieldAccessExpr = _createSemanticFieldAccessExpr(
+                        m_astBuilder,
+                        checkedInvokeExpr->arguments[valueArgIndex],
+                        checkedInvokeExpr->loc,
+                        lookup.path);
+
+                    auto otherExpr = checkedInvokeExpr->arguments[resultOrValueArgIndex];
+                    if (builtinName == KnownBuiltinDeclName::TryGetSemanticField)
+                        assignment = synth.emitAssignExpr(otherExpr, fieldAccessExpr);
+                    else
+                        assignment = synth.emitAssignExpr(fieldAccessExpr, otherExpr);
+                    assignment->loc = checkedInvokeExpr->loc;
+                }
+
+                assignment = dispatchExpr(assignment, *this);
+                if (IsErrorExpr(assignment))
+                    return assignment;
+
+                return moveTemp(
+                    assignment,
+                    [&](DeclRef<VarDeclBase>)
+                    { return _createCheckedBoolLiteralExpr(m_astBuilder, checkedInvokeExpr->loc, true); });
             }
+
+        default:
+            break;
         }
     }
+
+    return invokeExpr;
 }
 
 Expr* SemanticsVisitor::maybeDereference(Expr* inExpr, CheckBaseContext checkBaseContext)

@@ -1023,9 +1023,9 @@ void createVarLayoutForLegalizedGlobalParam(
     // Make sure we respect the decoration on the inner most node.
     // So that the decoration on a struct field overrides the outer decoration
     // on a parameter of the struct type.
-    for (; outerParamInfo; outerParamInfo = outerParamInfo->next)
+    for (auto paramInfoLink = outerParamInfo; paramInfoLink; paramInfoLink = paramInfoLink->next)
     {
-        auto paramInfo = outerParamInfo->outerParam;
+        auto paramInfo = paramInfoLink->outerParam;
         auto decorParent = paramInfo;
         if (auto field = as<IRStructField>(decorParent))
             decorParent = field->getKey();
@@ -1033,6 +1033,18 @@ void createVarLayoutForLegalizedGlobalParam(
                 decorParent->findDecoration<IRInterpolationModeDecoration>())
         {
             builder->addInterpolationModeDecoration(globalParam, interpolationModeDecor->getMode());
+            break;
+        }
+    }
+
+    for (auto paramInfoLink = outerParamInfo; paramInfoLink; paramInfoLink = paramInfoLink->next)
+    {
+        auto decorParent = paramInfoLink->outerParam;
+        if (auto field = as<IRStructField>(decorParent))
+            decorParent = field->getKey();
+        if (auto locationDecor = decorParent->findDecoration<IRGLSLLocationDecoration>())
+        {
+            builder->addDecoration(globalParam, kIROp_GLSLLocationDecoration, locationDecor->getLocation());
             break;
         }
     }

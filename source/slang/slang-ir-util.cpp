@@ -1488,7 +1488,15 @@ bool areCallArgumentsSideEffectFree(IRCall* call, SideEffectAnalysisOptions opti
                     // after the call.
                     if (use->getUser() == call)
                     {
-                        auto funcType = as<IRFuncType>(call->getCallee()->getDataType());
+                        auto funcType = as<IRFuncType>(call->getCallee()->getFullType());
+                        if (!funcType)
+                        {
+                            if (auto resolvedCallee =
+                                    getResolvedInstForDecorations(call->getCallee()))
+                            {
+                                funcType = as<IRFuncType>(resolvedCallee->getFullType());
+                            }
+                        }
                         if (!funcType)
                             return false;
                         if (funcType->getParamCount() > i &&
@@ -2134,6 +2142,12 @@ UnownedStringSlice getBuiltinFuncName(IRInst* callee)
         return UnownedStringSlice::fromLiteral("GeometryStreamRestart");
     case KnownBuiltinDeclName::GetAttributeAtVertex:
         return UnownedStringSlice::fromLiteral("GetAttributeAtVertex");
+    case KnownBuiltinDeclName::HasSemanticField:
+        return UnownedStringSlice::fromLiteral("hasSemanticField");
+    case KnownBuiltinDeclName::TryGetSemanticField:
+        return UnownedStringSlice::fromLiteral("tryGetSemanticField");
+    case KnownBuiltinDeclName::TrySetSemanticField:
+        return UnownedStringSlice::fromLiteral("trySetSemanticField");
     case KnownBuiltinDeclName::DispatchMesh:
         return UnownedStringSlice::fromLiteral("DispatchMesh");
     case KnownBuiltinDeclName::saturated_cooperation:

@@ -139,7 +139,13 @@ struct SPIRVLegalizationContext : public SourceEmitterBase
         const auto structType = builder.createStructType();
         builder.addPhysicalTypeDecoration(structType);
         const auto arrayKey = builder.createStructKey();
-        builder.createStructField(structType, arrayKey, arrayType);
+        auto arrayField = builder.createStructField(structType, arrayKey, arrayType);
+        auto intType = builder.getIntType();
+        builder.addDecoration(
+            arrayField,
+            kIROp_OffsetDecoration,
+            builder.getIntValue(intType, (IRIntegerValue)layoutRules->ruleName),
+            builder.getIntValue(intType, 0));
         IRSizeAndAlignment structSize;
         getSizeAndAlignment(m_sharedContext->m_targetRequest, layoutRules, structType, &structSize);
 

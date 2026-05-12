@@ -86,6 +86,7 @@
 #include "slang-ir-lower-enum-type.h"
 #include "slang-ir-lower-glsl-ssbo-types.h"
 #include "slang-ir-lower-l-value-cast.h"
+#include "slang-ir-lower-semantic-field-access.h"
 #include "slang-ir-lower-optional-type.h"
 #include "slang-ir-lower-reinterpret.h"
 #include "slang-ir-lower-result-type.h"
@@ -1205,6 +1206,10 @@ Result linkAndOptimizeIR(
     SLANG_PASS(lowerTuples, sink);
 
     SLANG_PASS(generateAnyValueMarshallingFunctions, targetProgram);
+
+    // These helpers need fully specialized types, but must still resolve before branch
+    // simplification and static_assert processing.
+    SLANG_PASS(lowerSemanticFieldAccessBuiltins, sink);
 
     // Don't need to run any further target-dependent passes if we are generating code
     // for host vm.

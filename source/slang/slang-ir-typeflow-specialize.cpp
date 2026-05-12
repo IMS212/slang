@@ -3718,6 +3718,11 @@ struct TypeFlowSpecializationContext
                 return nullptr;
         }
 
+        // `OptionalNoneType` is an analysis-only marker. Keep the original
+        // runtime type instead of rewriting IR values to this internal type.
+        if (as<IROptionalNoneType>(info))
+            return nullptr;
+
         if (auto taggedUnion = as<IRTaggedUnionType>(info))
         {
             return (IRType*)taggedUnion;
@@ -5624,7 +5629,17 @@ struct TypeFlowSpecializationContext
 
     bool specializeOptionalHasValue(IRInst* context, IROptionalHasValue* inst)
     {
-        SLANG_UNUSED(context);
+        if (auto info = tryGetInfo(context, inst->getOptionalOperand()))
+        {
+            if (as<IROptionalNoneType>(info))
+            {
+                IRBuilder builder(inst);
+                inst->replaceUsesWith(builder.getBoolValue(false));
+                inst->removeAndDeallocate();
+                return true;
+            }
+        }
+
         if (auto taggedUnionType = as<IRTaggedUnionType>(inst->getOptionalOperand()->getDataType()))
         {
             // The logic here is similar to specializing IsType, but we'll directly compare

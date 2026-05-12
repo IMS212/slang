@@ -4798,6 +4798,13 @@ typedef int (*SlangBindlessCombinedSamplerResolverCallback)(
     const char* resourceName,
     void* userData);
 
+/** Callback type for resolving SPIR-V fragment color output locations.
+@param outputName The fragment output member name, such as "color" or "normal"
+@param userData User-provided context pointer
+@return SPIR-V Location for this output, or a negative value if unresolved
+*/
+typedef int (*SlangFragmentOutputResolverCallback)(const char* outputName, void* userData);
+
 /** IComponentType3 provides support for bindless resource lowering.
 
 This interface allows setting a map from resource names to bindless descriptor indices.
@@ -4897,6 +4904,29 @@ struct IComponentType5 : public ISlangUnknown
         void* userData) = 0;
 };
     #define SLANG_UUID_IComponentType5 IComponentType5::getTypeGuid()
+
+/** IComponentType6 provides support for resolving SPIR-V fragment color output locations. */
+struct IComponentType6 : public ISlangUnknown
+{
+    SLANG_COM_INTERFACE(
+        0xf2c9284a,
+        0x6f96,
+        0x4fc1,
+        {0x86, 0xee, 0x5d, 0x4c, 0xee, 0x41, 0x69, 0x31})
+
+    /** Set a callback for resolving fragment output locations for a specific target.
+
+    @param targetIndex The target index to configure
+    @param callback The fragment output resolver callback function
+    @param userData User data passed to the callback
+    @return SLANG_OK on success
+    */
+    virtual SLANG_NO_THROW SlangResult SLANG_MCALL setFragmentOutputResolver(
+        SlangInt targetIndex,
+        SlangFragmentOutputResolverCallback callback,
+        void* userData) = 0;
+};
+    #define SLANG_UUID_IComponentType6 IComponentType6::getTypeGuid()
 
 /** A module is the granularity of shader code compilation and loading.
 

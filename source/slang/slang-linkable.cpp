@@ -115,6 +115,8 @@ ISlangUnknown* ComponentType::getInterface(Guid const& guid)
         return static_cast<slang::IComponentType4*>(this);
     if (guid == IComponentType5::getTypeGuid())
         return static_cast<slang::IComponentType5*>(this);
+    if (guid == IComponentType6::getTypeGuid())
+        return static_cast<slang::IComponentType6*>(this);
     return nullptr;
 }
 
@@ -630,6 +632,22 @@ SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::setBindlessCombinedSampler
     auto target = linkage->targets[targetIndex];
     auto targetProgram = getTargetProgram(target);
     targetProgram->setBindlessCombinedSamplerResolver(callback, userData);
+
+    return SLANG_OK;
+}
+
+SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::setFragmentOutputResolver(
+    Int targetIndex,
+    slang::SlangFragmentOutputResolverCallback callback,
+    void* userData)
+{
+    auto linkage = getLinkage();
+    if (targetIndex < 0 || targetIndex >= linkage->targets.getCount())
+        return SLANG_E_INVALID_ARG;
+
+    auto target = linkage->targets[targetIndex];
+    auto targetProgram = getTargetProgram(target);
+    targetProgram->setFragmentOutputResolver(callback, userData);
 
     return SLANG_OK;
 }

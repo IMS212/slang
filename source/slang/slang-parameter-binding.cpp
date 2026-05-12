@@ -1947,36 +1947,16 @@ static RefPtr<TypeLayout> processEntryPointVaryingParameterDecl(
 
     // For Khronos targets (OpenGL and Vulkan), we need to process
     // the `[[vk::location(...)]]` and `[[vk::index(...)]]` attributes,
-    // if present.
-    //
-    // TODO: In principle we should *also* be using the data from
-    // `SV_Target<N>` semantics as an equivalent to `location = <N>`
-    // when targetting Vulkan. Right now we are kind of skating by
-    // on the fact that people almost always declare `SV_Target`s
-    // in numerical order, so that our automatic assignment of
-    // `location`s in declaration order coincidentally matches
-    // the `SV_Target` order.
+    // if present. When targeting a fragment shader, `SV_Target<N>`
+    // should also imply `location = N` unless an explicit
+    // `[[vk::location(...)]]` overrides it.
     //
     if (decl &&
         (isKhronosTarget(context->getTargetRequest()) ||
          isMetalTarget(context->getTargetRequest()) || isWGPUTarget(context->getTargetRequest())))
     {
-        if (auto locationAttr = decl->findModifier<GLSLLocationAttribute>())
+        auto applyLocationAndIndex = [&](UInt location, UInt index)
         {
-            int location = locationAttr->value;
-
-            int index = 0;
-            if (auto indexAttr = decl->findModifier<GLSLIndexAttribute>())
-            {
-                index = indexAttr->value;
-            }
-
-            // TODO: We should eventually include validation that a non-zero
-            // `vk::index` is only valid for fragment shader color outputs.
-
-            // Once we've extracted the data from the attribute(s), we
-            // need to apply it to the `varLayout` for the parameter/field `decl`.
-            //
             LayoutResourceKind kinds[] = {
                 LayoutResourceKind::VaryingInput,
                 LayoutResourceKind::VaryingOutput};
@@ -1987,7 +1967,7 @@ static RefPtr<TypeLayout> processEntryPointVaryingParameterDecl(
                     continue;
 
                 auto varResInfo = varLayout->findOrAddResourceInfo(kind);
-                varResInfo->index = (UInt)location;
+                varResInfo->index = location;
 
                 // Note: OpenGL and Vulkan represent dual-source color blending
                 // differently from multiple render targets (MRT) at the source
@@ -2014,6 +1994,35 @@ static RefPtr<TypeLayout> processEntryPointVaryingParameterDecl(
                 //
                 varResInfo->space = index;
             }
+        };
+
+        if (auto locationAttr = decl->findModifier<GLSLLocationAttribute>())
+        {
+            int location = locationAttr->value;
+
+            int index = 0;
+            if (auto indexAttr = decl->findModifier<GLSLIndexAttribute>())
+            {
+                index = indexAttr->value;
+            }
+
+            // TODO: We should eventually include validation that a non-zero
+            // `vk::index` is only valid for fragment shader color outputs.
+
+            // Once we've extracted the data from the attribute(s), we
+            // need to apply it to the `varLayout` for the parameter/field `decl`.
+            //
+            applyLocationAndIndex((UInt)location, (UInt)index);
+        }
+        else if (
+            isKhronosTarget(context->getTargetRequest()) &&
+            (state.directionMask & kEntryPointParameterDirection_Output) &&
+            state.stage == Stage::Fragment &&
+            state.optSemanticName &&
+            state.ioSemanticIndex &&
+            state.optSemanticName->toLower() == "sv_target")
+        {
+            applyLocationAndIndex((UInt)(*state.ioSemanticIndex), 0);
         }
         else if (auto indexAttr = decl->findModifier<GLSLIndexAttribute>())
         {
@@ -2568,6 +2577,16 @@ static RefPtr<TypeLayout> processEntryPointVaryingParameter(
                 RefPtr<TypeLayout> assocTypeLayout = new TypeLayout();
                 assocTypeLayout->type = type;
                 return assocTypeLayout;
+            }
+            else if (auto simpleGenericParam = declRef.as<GenericTypeParamDecl>())
+            {
+                // Generic entry points can surface ordinary generic type
+                // parameters here before specialization/layout is finalized.
+                // We can't assign varying slots to an unconstrained type, so
+                // preserve the type and leave resource usage empty.
+                RefPtr<TypeLayout> genericTypeLayout = new TypeLayout();
+                genericTypeLayout->type = type;
+                return genericTypeLayout;
             }
             else
             {
@@ -3208,8 +3227,23 @@ static RefPtr<EntryPointLayout> collectEntryPointParameters(
             for (auto rr : resultTypeLayout->resourceInfos)
             {
                 auto entryPointRes = paramsStructLayout->findOrAddResourceInfo(rr.kind);
-                resultLayout->findOrAddResourceInfo(rr.kind)->index =
-                    entryPointRes->count.getFiniteValue();
+                auto resultResInfo = resultLayout->findOrAddResourceInfo(rr.kind);
+
+                switch (rr.kind)
+                {
+                case LayoutResourceKind::VaryingInput:
+                case LayoutResourceKind::VaryingOutput:
+                case LayoutResourceKind::ShaderRecord:
+                case LayoutResourceKind::HitAttributes:
+                case LayoutResourceKind::ExistentialObjectParam:
+                case LayoutResourceKind::ExistentialTypeParam:
+                    resultResInfo->index = 0;
+                    break;
+
+                default:
+                    resultResInfo->index = entryPointRes->count.getFiniteValue();
+                    break;
+                }
                 entryPointRes->count += rr.count;
             }
         }

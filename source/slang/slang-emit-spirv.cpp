@@ -3311,6 +3311,63 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         }
     }
 
+    UnownedStringSlice getFragmentOutputResolverName(IRInst* var)
+    {
+        if (auto nameDecor = var->findDecoration<IRNameHintDecoration>())
+        {
+            auto name = nameDecor->getName();
+            auto dotIndex = name.indexOf('.');
+            if (dotIndex >= 0)
+                return name.tail(dotIndex + 1);
+
+            const auto entryPointParamPrefix = UnownedStringSlice("entryPointParam_");
+            if (name.startsWith(entryPointParamPrefix))
+                return name.tail(entryPointParamPrefix.getLength());
+
+            return name;
+        }
+        return UnownedStringSlice("<unnamed>");
+    }
+
+    bool tryEmitFragmentOutputResolverLocation(
+        IRInst* var,
+        SpvInst* varInst,
+        IRVarLayout* layout,
+        SpvStorageClass storageClass)
+    {
+        if (!m_targetProgram->m_fragmentOutputResolver)
+            return false;
+        if (var->findDecoration<IRGLSLLocationDecoration>())
+            return false;
+        if (!layout || layout->getStage() != Stage::Fragment)
+            return false;
+        if (storageClass != SpvStorageClassOutput)
+            return false;
+        if (!layout->usesResourceKind(LayoutResourceKind::VaryingOutput))
+            return false;
+
+        auto outputNameSlice = getFragmentOutputResolverName(var);
+        String outputName(outputNameSlice);
+        int resolvedLocation = m_targetProgram->m_fragmentOutputResolver(
+            outputName.getBuffer(),
+            m_targetProgram->m_fragmentOutputResolverUserData);
+        if (resolvedLocation < 0)
+        {
+            StringBuilder message;
+            message << "fragment output resolver could not resolve output '" << outputName << "'";
+            m_sink->diagnose(
+                Diagnostics::Unexpected{message.produceString(), getDiagnosticPos(var)});
+            return true;
+        }
+
+        emitOpDecorateLocation(
+            getSection(SpvLogicalSectionID::Annotations),
+            nullptr,
+            varInst,
+            SpvLiteralInteger::from32(int32_t(resolvedLocation)));
+        return true;
+    }
+
     void emitVarLayout(IRInst* var, SpvInst* varInst, IRVarLayout* layout)
     {
         auto dataType = as<IRPtrTypeBase>(var->getDataType());
@@ -3320,6 +3377,20 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         bool needDefaultSetBindingDecoration = false;
         bool hasExplicitSetBinding = false;
         bool isDescirptorSetDecorated = false;
+        bool emitVaryingOutputFromSemantic = false;
+        UInt varyingOutputSemanticIndex = 0;
+        UInt varyingOutputIndex = 0;
+
+        if (auto systemValueAttr = layout->findSystemValueSemanticAttr())
+        {
+            auto semanticName = String(systemValueAttr->getName()).toLower();
+            if (semanticName == "sv_target" && !var->findDecoration<IRGLSLLocationDecoration>())
+            {
+                emitVaryingOutputFromSemantic = true;
+                varyingOutputSemanticIndex = systemValueAttr->getIndex();
+            }
+        }
+
         for (auto rr : layout->getOffsetAttrs())
         {
             UInt index = rr->getOffset();
@@ -3345,18 +3416,28 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 }
                 break;
             case LayoutResourceKind::VaryingOutput:
-                emitOpDecorateLocation(
-                    getSection(SpvLogicalSectionID::Annotations),
-                    nullptr,
-                    varInst,
-                    SpvLiteralInteger::from32(int32_t(index)));
-                if (space != 0)
+                if (emitVaryingOutputFromSemantic)
                 {
-                    emitOpDecorateIndex(
-                        getSection(SpvLogicalSectionID::Annotations),
-                        nullptr,
-                        varInst,
-                        SpvLiteralInteger::from32(int32_t(space)));
+                    varyingOutputIndex = space;
+                }
+                else
+                {
+                    if (!tryEmitFragmentOutputResolverLocation(var, varInst, layout, storageClass))
+                    {
+                        emitOpDecorateLocation(
+                            getSection(SpvLogicalSectionID::Annotations),
+                            nullptr,
+                            varInst,
+                            SpvLiteralInteger::from32(int32_t(index)));
+                    }
+                    if (space != 0)
+                    {
+                        emitOpDecorateIndex(
+                            getSection(SpvLogicalSectionID::Annotations),
+                            nullptr,
+                            varInst,
+                            SpvLiteralInteger::from32(int32_t(space)));
+                    }
                 }
                 break;
 
@@ -3472,6 +3553,26 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                     UnownedStringSlice("SPV_EXT_descriptor_indexing"));
                 requireSPIRVCapability(SpvCapabilityRuntimeDescriptorArray);
                 break;
+            }
+        }
+
+        if (emitVaryingOutputFromSemantic)
+        {
+            if (!tryEmitFragmentOutputResolverLocation(var, varInst, layout, storageClass))
+            {
+                emitOpDecorateLocation(
+                    getSection(SpvLogicalSectionID::Annotations),
+                    nullptr,
+                    varInst,
+                    SpvLiteralInteger::from32(int32_t(varyingOutputSemanticIndex)));
+            }
+            if (varyingOutputIndex != 0)
+            {
+                emitOpDecorateIndex(
+                    getSection(SpvLogicalSectionID::Annotations),
+                    nullptr,
+                    varInst,
+                    SpvLiteralInteger::from32(int32_t(varyingOutputIndex)));
             }
         }
     }
@@ -6731,23 +6832,37 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
     {
         SpvBuiltIn builtinName;
         SpvStorageClass storageClass = SpvStorageClassInput;
+        IRType* type = nullptr;
         bool flat = false;
+        bool perPrimitive = false;
         BuiltinSpvVarKey() = default;
-        BuiltinSpvVarKey(SpvBuiltIn builtin, SpvStorageClass storageClass, bool isFlat)
-            : builtinName(builtin), storageClass(storageClass), flat(isFlat)
+        BuiltinSpvVarKey(
+            SpvBuiltIn builtin,
+            SpvStorageClass storageClass,
+            IRType* type,
+            bool isFlat,
+            bool isPerPrimitive)
+            : builtinName(builtin)
+            , storageClass(storageClass)
+            , type(type)
+            , flat(isFlat)
+            , perPrimitive(isPerPrimitive)
         {
         }
         bool operator==(const BuiltinSpvVarKey& other) const
         {
             return builtinName == other.builtinName && storageClass == other.storageClass &&
-                   flat == other.flat;
+                   type == other.type && flat == other.flat &&
+                   perPrimitive == other.perPrimitive;
         }
         HashCode getHashCode() const
         {
             return combineHash(
                 Slang::getHashCode(builtinName),
                 Slang::getHashCode(storageClass),
-                Slang::getHashCode(flat));
+                Slang::getHashCode(type),
+                Slang::getHashCode(flat),
+                Slang::getHashCode(perPrimitive));
         }
     };
     Dictionary<BuiltinSpvVarKey, SpvInst*> m_builtinGlobalVars;
@@ -6793,6 +6908,75 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         return false;
     }
 
+    bool isMeshPerPrimitiveBuiltin(SpvBuiltIn builtinVal)
+    {
+        switch (builtinVal)
+        {
+        case SpvBuiltInPrimitiveId:
+        case SpvBuiltInLayer:
+        case SpvBuiltInViewportIndex:
+        case SpvBuiltInCullPrimitiveEXT:
+        case SpvBuiltInPrimitiveShadingRateKHR:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    IRInst* getMeshOutputPrimitiveCount(IRInst* inst)
+    {
+        if (!inst)
+            return nullptr;
+
+        auto* referencingEntryPoints = m_referencingEntryPoints.tryGetValue(inst);
+        if (!referencingEntryPoints)
+            return nullptr;
+
+        for (auto entryPoint : *referencingEntryPoints)
+        {
+            if (auto entryPointDecor = entryPoint->findDecoration<IREntryPointDecoration>())
+            {
+                if (entryPointDecor->getProfile().getStage() != Stage::Mesh)
+                    continue;
+                if (auto primitivesDecor = entryPoint->findDecoration<IRPrimitivesDecoration>())
+                    return primitivesDecor->getMaxSize();
+            }
+        }
+        return nullptr;
+    }
+
+    IRType* getMeshPerPrimitiveBuiltinType(
+        IRType* type,
+        IRInst* primitiveCount,
+        SpvBuiltIn builtinVal)
+    {
+        if (!isMeshPerPrimitiveBuiltin(builtinVal))
+            return type;
+
+        if (!primitiveCount)
+            return type;
+
+        auto ptrType = as<IRPtrTypeBase>(type);
+        if (!ptrType)
+            return type;
+
+        auto arrayType = as<IRArrayTypeBase>(ptrType->getValueType());
+        if (!arrayType)
+            return type;
+
+        if (arrayType->getElementCount() == primitiveCount)
+            return type;
+
+        IRBuilder builder(m_irModule);
+        builder.setInsertBefore(type);
+        auto primitiveArrayType = builder.getArrayTypeBase(
+            arrayType->getOp(),
+            arrayType->getElementType(),
+            primitiveCount,
+            arrayType->getArrayStride());
+        return builder.getPtrType((IRType*)primitiveArrayType, ptrType);
+    }
+
     SpvInst* getBuiltinGlobalVar(IRType* type, SpvBuiltIn builtinVal, IRInst* irInst)
     {
         SpvInst* result = nullptr;
@@ -6800,7 +6984,17 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         SLANG_ASSERT(ptrType && "`getBuiltinGlobalVar`: `type` must be ptr type.");
         auto storageClass = addressSpaceToStorageClass(ptrType->getAddressSpace());
         bool isFlat = needFlatDecorationForBuiltinVar(irInst);
-        auto key = BuiltinSpvVarKey(builtinVal, storageClass, isFlat);
+        IRInst* meshPrimitiveCount = storageClass == SpvStorageClassOutput
+                                         ? getMeshOutputPrimitiveCount(irInst)
+                                         : nullptr;
+        bool isPerPrimitive = meshPrimitiveCount && isMeshPerPrimitiveBuiltin(builtinVal);
+        if (isPerPrimitive)
+        {
+            type = getMeshPerPrimitiveBuiltinType(type, meshPrimitiveCount, builtinVal);
+            ptrType = as<IRPtrTypeBase>(type);
+            SLANG_ASSERT(ptrType && "`getBuiltinGlobalVar`: `type` must be ptr type.");
+        }
+        auto key = BuiltinSpvVarKey(builtinVal, storageClass, type, isFlat, isPerPrimitive);
         if (m_builtinGlobalVars.tryGetValue(key, result))
         {
             return result;
@@ -6827,6 +7021,14 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 varInst,
                 SpvDecorationPatch);
             break;
+        }
+        if (isPerPrimitive)
+        {
+            emitOpDecorate(
+                getSection(SpvLogicalSectionID::Annotations),
+                nullptr,
+                varInst,
+                SpvDecorationPerPrimitiveEXT);
         }
         m_builtinGlobalVars[key] = varInst;
 
@@ -11017,6 +11219,8 @@ SlangResult emitSPIRVFromIR(
         context.ensureInst(irEntryPoint);
         symbolsEmitted = true;
     }
+    if (sink->getErrorCount() != 0)
+        return SLANG_FAIL;
 
     if (!symbolsEmitted)
     {

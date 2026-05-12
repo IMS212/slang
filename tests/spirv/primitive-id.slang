@@ -8,7 +8,12 @@ struct PerPrimitive {
     uint32_t layer : SV_RenderTargetArrayIndex;
 };
 
+// CHECK: OpDecorate %gl_PrimitiveID BuiltIn PrimitiveId
+// CHECK: OpDecorate %gl_PrimitiveID PerPrimitive{{NV|EXT}}
 // CHECK: %gl_PrimitiveID = OpVariable %_ptr_Output__arr_int_int_1 Output
+// CHECK: OpDecorate %gl_Layer BuiltIn Layer
+// CHECK: OpDecorate %gl_Layer PerPrimitive{{NV|EXT}}
+// CHECK: %gl_Layer = OpVariable %_ptr_Output__arr_int_int_1 Output
 
 [shader("mesh")]
 [numthreads(1, 1, 1)]

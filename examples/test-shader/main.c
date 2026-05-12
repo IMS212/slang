@@ -62,6 +62,7 @@ int bindlessResolver(
         typeName = "SampledImage";
         heapBinding = 2;
         break;
+        
     case SLANGC_BINDLESS_STORAGE_IMAGE:
         typeName = "StorageImage";
         heapBinding = 3;
@@ -217,6 +218,12 @@ SlangcModule loadMod(SlangcCompiler compiler, char* str, char* text)
     }
     return mod;
 }
+int fragmentOutputResolver(const char* output_name, void* user_data)
+{
+    printf("%s\n", output_name);
+    if (strstr(output_name, "norm") !=  NULL) return 1;
+    return 3;
+}
 int main(int argc, char** argv)
 {
     (void)argc;
@@ -269,6 +276,7 @@ int main(int argc, char** argv)
     slangc_setBindlessResolver(compiler, bindlessResolver, NULL);
     slangc_setBindlessArrayResolver(compiler, bindlessArrayResolver, NULL);
     slangc_setBindlessCombinedSamplerResolver(compiler, bindlessCombinedSamplerResolver, NULL);
+    slangc_setFragmentOutputResolver(compiler, fragmentOutputResolver, NULL);
 
     int paramCount = slangc_getSpecializationParamCount(program);
     printf("Specialization parameters required: %d\n", paramCount);

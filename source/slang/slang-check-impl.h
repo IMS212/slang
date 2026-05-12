@@ -3152,7 +3152,7 @@ public:
 
     Expr* visitLambdaExpr(LambdaExpr* expr);
 
-    void maybeCheckKnownBuiltinInvocation(Expr* invokeExpr);
+    Expr* maybeCheckKnownBuiltinInvocation(Expr* invokeExpr);
 
     //
     // Some syntax nodes should not occur in the concrete input syntax,

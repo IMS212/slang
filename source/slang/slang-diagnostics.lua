@@ -3863,6 +3863,27 @@ err(
     span { loc = "location", message = "the current compilation target does not support 'DescriptorHandle' types." }
 )
 
+err(
+    "semantic-field-lookup-ambiguous",
+    39030,
+    "semantic field lookup is ambiguous",
+    span { loc = "location", message = "semantic field lookup for '~semanticName' with index '~semanticIndex:int' is ambiguous in type '~type:Type'." }
+)
+
+err(
+    "semantic-field-lookup-ambiguous-ir",
+    39031,
+    "semantic field lookup is ambiguous",
+    span { loc = "location", message = "semantic field lookup for '~semanticName' with index '~semanticIndex:int' is ambiguous in type '~type:IRInst'." }
+)
+
+err(
+    "semantic-field-type-mismatch-ir",
+    39032,
+    "semantic field type does not match helper type",
+    span { loc = "location", message = "semantic field '~semanticName' with index '~semanticIndex:int' has type '~fieldType:IRInst', but helper expects type '~expectedType:IRInst'." }
+)
+
 warning(
     "register-modifier-but-no-vk-binding-nor-shift",
     39029,

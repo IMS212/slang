@@ -155,6 +155,14 @@ public:
         m_bindlessCombinedSamplerResolverUserData = userData;
     }
 
+    void setFragmentOutputResolver(
+        slang::SlangFragmentOutputResolverCallback callback,
+        void* userData)
+    {
+        m_fragmentOutputResolver = callback;
+        m_fragmentOutputResolverUserData = userData;
+    }
+
     /// Map of resource names to bindless indices for conversion.
     /// This is public so IR passes can access it directly.
     Dictionary<String, int> m_bindlessResourceIndexMap;
@@ -177,6 +185,9 @@ public:
     /// texture-sampler resources to texture + sampler pairs.
     BindlessCombinedSamplerResolverCallback m_bindlessCombinedSamplerResolver = nullptr;
     void* m_bindlessCombinedSamplerResolverUserData = nullptr;
+
+    slang::SlangFragmentOutputResolverCallback m_fragmentOutputResolver = nullptr;
+    void* m_fragmentOutputResolverUserData = nullptr;
 
 private:
     RefPtr<IRModule> createIRModuleForLayout(DiagnosticSink* sink);

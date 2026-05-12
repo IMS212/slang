@@ -360,10 +360,12 @@ struct BindlessResourceLoweringContext
         return changed;
     }
 
-    uint64_t makeResourceHeapKey(int bindingIndex, IRType* elementType)
+    uint64_t makeResourceHeapKey(int bindingIndex, IRType* elementType, IRType* dataLayoutType)
     {
-        // Combine binding index with type pointer for unique key
-        return ((uint64_t)bindingIndex << 48) | ((uint64_t)(uintptr_t)elementType & 0xFFFFFFFFFFFF);
+        // Combine binding index, element type, and layout type for unique key.
+        auto typeHash = (uint64_t)(uintptr_t)elementType;
+        auto layoutHash = (uint64_t)(uintptr_t)dataLayoutType;
+        return ((uint64_t)bindingIndex << 56) ^ ((typeHash << 8) | (typeHash >> 56)) ^ layoutHash;
     }
 
     // Create a var layout for a resource heap with specific set/binding
@@ -428,14 +430,20 @@ struct BindlessResourceLoweringContext
 
     // Get or create a resource heap for a given binding index and element type
     // Creates a real GlobalParam (OpVariable in SPIR-V), not an intrinsic
-    IRGlobalParam* getOrCreateResourceHeap(int bindingIndex, IRType* elementType)
+    IRGlobalParam* getOrCreateResourceHeap(
+        int bindingIndex,
+        IRType* elementType,
+        IRType* dataLayoutType = nullptr)
     {
-        auto key = makeResourceHeapKey(bindingIndex, elementType);
+        IRBuilder moduleBuilder(module);
+        if (!dataLayoutType)
+            dataLayoutType = moduleBuilder.getDefaultBufferLayoutType();
+
+        auto key = makeResourceHeapKey(bindingIndex, elementType, dataLayoutType);
         if (auto* existing = resourceHeaps.tryGetValue(key))
             return *existing;
 
         // Create a GlobalParam at module scope - this becomes OpVariable in SPIR-V
-        IRBuilder moduleBuilder(module);
         moduleBuilder.setInsertInto(module->getModuleInst());
 
         auto unboundedArrayType = moduleBuilder.getUnsizedArrayType(elementType);
@@ -459,7 +467,7 @@ struct BindlessResourceLoweringContext
             unboundedArrayType,
             AccessQualifier::ReadWrite,
             addrSpace,
-            moduleBuilder.getDefaultBufferLayoutType());
+            dataLayoutType);
 
         // Create a real global parameter (becomes OpVariable in SPIR-V)
         auto resourceHeap = moduleBuilder.createGlobalParam(heapPtrType);
@@ -497,6 +505,7 @@ struct BindlessResourceLoweringContext
 
         // Get the layout rules for this buffer type to compute proper stride
         auto layoutRules = getTypeLayoutRuleForBuffer(targetProgram, bufferType);
+        bool shouldKeepLogicalElementType = !typeNeedsStorageLoweringForSPIRV(elementType);
 
         // For element types that are structs used in storage buffers, we need to ensure
         // they have the correct Std430 layout. The SPIRV emitter uses the first
@@ -555,10 +564,12 @@ struct BindlessResourceLoweringContext
             &elementSize);
         elementSize = layoutRules->alignCompositeElement(elementSize);
 
-        // Mark element type as physical if it's a struct (enables SPIRV member offset decorations)
-        if (auto elementStruct = as<IRStructType>(elementType))
+        if (shouldKeepLogicalElementType)
         {
-            moduleBuilder.addPhysicalTypeDecoration(elementStruct);
+            if (auto elementStruct = as<IRStructType>(elementType))
+            {
+                moduleBuilder.addPhysicalTypeDecoration(elementStruct);
+            }
         }
 
         auto wrapperStruct = moduleBuilder.createStructType();
@@ -574,7 +585,13 @@ struct BindlessResourceLoweringContext
             moduleBuilder.getIntValue(moduleBuilder.getIntType(), elementSize.getStride()));
 
         // Add the array as a field of the wrapper struct
-        moduleBuilder.createStructField(wrapperStruct, arrayKey, unsizedArrayType);
+        auto arrayField = moduleBuilder.createStructField(wrapperStruct, arrayKey, unsizedArrayType);
+        auto intType = moduleBuilder.getIntType();
+        moduleBuilder.addDecoration(
+            arrayField,
+            kIROp_OffsetDecoration,
+            moduleBuilder.getIntValue(intType, (IRIntegerValue)layoutRules->ruleName),
+            moduleBuilder.getIntValue(intType, 0));
 
         // Compute size/alignment for the wrapper struct - this adds IRSizeAndAlignmentDecoration
         // which is needed by SPIRV emitter for proper layout decorations
@@ -662,8 +679,33 @@ struct BindlessResourceLoweringContext
         IRSizeAndAlignment elementSize;
         getSizeAndAlignment(targetProgram->getTargetReq(), layoutRules, elementType, &elementSize);
 
-        moduleBuilder.addPhysicalTypeDecoration(elementStruct);
+        if (!typeNeedsStorageLoweringForSPIRV(elementType))
+            moduleBuilder.addPhysicalTypeDecoration(elementStruct);
         moduleBuilder.addDecorationIfNotExist(elementStruct, kIROp_SPIRVBlockDecoration);
+    }
+
+    bool typeNeedsStorageLoweringForSPIRV(IRType* type)
+    {
+        type = (IRType*)unwrapAttributedType(type);
+        if (!type)
+            return false;
+        if (as<IRBoolType>(type))
+            return true;
+        if (auto vectorType = as<IRVectorType>(type))
+            return typeNeedsStorageLoweringForSPIRV(vectorType->getElementType());
+        if (auto matrixType = as<IRMatrixType>(type))
+            return typeNeedsStorageLoweringForSPIRV(matrixType->getElementType());
+        if (auto arrayType = as<IRArrayTypeBase>(type))
+            return typeNeedsStorageLoweringForSPIRV(arrayType->getElementType());
+        if (auto structType = as<IRStructType>(type))
+        {
+            for (auto field : structType->getFields())
+            {
+                if (typeNeedsStorageLoweringForSPIRV(field->getFieldType()))
+                    return true;
+            }
+        }
+        return false;
     }
 
     // Try to find a scalar resource name in the index map.
@@ -1237,7 +1279,17 @@ struct BindlessResourceLoweringContext
             isStructuredBuffer = true;
         }
 
-        IRInst* resourceHeap = getOrCreateResourceHeap(bindingIndex, heapElementType);
+        IRType* heapDataLayoutType = nullptr;
+        if (isUniformBuffer)
+        {
+            IRBuilder moduleBuilder(module);
+            moduleBuilder.setInsertInto(module->getModuleInst());
+            heapDataLayoutType =
+                getTypeLayoutTypeForBuffer(targetProgram, moduleBuilder, resourceType);
+        }
+
+        IRInst* resourceHeap =
+            getOrCreateResourceHeap(bindingIndex, heapElementType, heapDataLayoutType);
 
         if (isCombinedTextureResource)
         {
@@ -1623,6 +1675,13 @@ void lowerBindlessResources(
     context.targetProgram = targetProgram;
     context.outConvertedResources = outConvertedResources;
     context.processModule();
+
+    if (isSPIRV(targetProgram->getTargetReq()->getTarget()))
+    {
+        BufferElementTypeLoweringOptions options;
+        options.loweringPolicyKind = BufferElementTypeLoweringPolicyKind::KhronosTarget;
+        lowerBufferElementTypeToStorageType(module, targetProgram, options);
+    }
 }
 
 } // namespace Slang

@@ -100,6 +100,7 @@ class ComponentType : public RefObject,
                       public slang::IComponentType3,
                       public slang::IComponentType4,
                       public slang::IComponentType5,
+                      public slang::IComponentType6,
                       public slang::IModulePrecompileService_Experimental
 {
 public:
@@ -220,6 +221,14 @@ public:
     SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessCombinedSamplerResolver(
         SlangInt targetIndex,
         slang::SlangBindlessCombinedSamplerResolverCallback callback,
+        void* userData) SLANG_OVERRIDE;
+
+    //
+    // slang::IComponentType6 interface
+    //
+    SLANG_NO_THROW SlangResult SLANG_MCALL setFragmentOutputResolver(
+        SlangInt targetIndex,
+        slang::SlangFragmentOutputResolverCallback callback,
         void* userData) SLANG_OVERRIDE;
 
     //

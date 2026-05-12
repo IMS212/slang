@@ -160,6 +160,16 @@ typedef int (*SlangcBindlessCombinedSamplerResolverCallback)(
 );
 
 /*
+ * Fragment output resolver callback.
+ * Called during SPIR-V emission for automatic fragment color output locations.
+ * Return the SPIR-V Location for this output, or < 0 if unresolved.
+ */
+typedef int (*SlangcFragmentOutputResolverCallback)(
+    const char* outputName,
+    void* userData
+);
+
+/*
  * File loading callback.
  * Returns pointer to file contents and sets *outSize.
  * Returns NULL on failure.
@@ -300,6 +310,16 @@ SLANGC_API void slangc_setBindlessArrayResolver(
 SLANGC_API void slangc_setBindlessCombinedSamplerResolver(
     SlangcCompiler compiler,
     SlangcBindlessCombinedSamplerResolverCallback callback,
+    void* userData
+);
+
+/*
+ * Set a fragment output resolver callback.
+ * This callback resolves SPIR-V fragment color output names to Location decorations.
+ */
+SLANGC_API void slangc_setFragmentOutputResolver(
+    SlangcCompiler compiler,
+    SlangcFragmentOutputResolverCallback callback,
     void* userData
 );
 

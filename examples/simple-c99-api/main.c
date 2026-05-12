@@ -24,6 +24,7 @@ static const char* shaderSource =
     "struct PSOutput\n"
     "{\n"
     "    float4 color : SV_Target0;\n"
+    "    float4 normal : SV_Target1;\n"
     "};\n"
     "\n"
     "[shader(\"fragment\")]\n"
@@ -33,6 +34,7 @@ static const char* shaderSource =
     "    float4 d = diffuse.Sample(textureSampler, uv);\n"
     "    float4 n = normal.Sample(textureSampler, uv);\n"
     "    result.color = d * 0.5 + n * 0.5;\n"
+    "    result.normal = n;\n"
     "    return result;\n"
     "}\n";
 
@@ -110,6 +112,25 @@ int bindlessResolver(
     return slot;
 }
 
+int fragmentOutputResolver(const char* outputName, void* userData)
+{
+    (void)userData;
+
+    if (strcmp(outputName, "color") == 0)
+    {
+        printf("  Fragment output resolver: %s -> Location 3\n", outputName);
+        return 3;
+    }
+    if (strcmp(outputName, "normal") == 0)
+    {
+        printf("  Fragment output resolver: %s -> Location 7\n", outputName);
+        return 7;
+    }
+
+    printf("  Fragment output resolver: %s unresolved\n", outputName);
+    return -1;
+}
+
 int main(int argc, char** argv)
 {
     (void)argc;
@@ -134,8 +155,8 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    /* Configure for SPIRV output */
-    slangc_setTarget(compiler, SLANGC_TARGET_SPIRV);
+    /* Configure for SPIRV assembly output */
+    slangc_setTarget(compiler, SLANGC_TARGET_SPIRV_ASM);
 
     /* Load shader module */
     SlangcModule mod = slangc_loadModuleFromString(compiler, "shader", shaderSource);
@@ -166,6 +187,8 @@ int main(int argc, char** argv)
     /* Set bindless resolver callback on compiler (global for all programs) */
     printf("Setting bindless resolver callback...\n");
     slangc_setBindlessResolver(compiler, bindlessResolver, NULL);
+    printf("Setting fragment output resolver callback...\n");
+    slangc_setFragmentOutputResolver(compiler, fragmentOutputResolver, NULL);
 
     /* Link */
     printf("\nLinking program...\n");

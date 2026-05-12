@@ -3305,6 +3305,36 @@ void unmodified(out T){}
 __intrinsic_op($(kIROp_GetStringHash))
 int getStringHash(String string);
 
+/// Returns whether `value` contains a field with the given semantic.
+__generic<T>
+[KnownBuiltin($( (int)KnownBuiltinDeclName::HasSemanticField))]
+bool hasSemanticField(T value, String semanticName);
+
+/// Returns whether `value` contains a field with the given semantic and index.
+__generic<T>
+[KnownBuiltin($( (int)KnownBuiltinDeclName::HasSemanticField))]
+bool hasSemanticField(T value, String semanticName, int semanticIndex);
+
+/// Attempts to read a field by semantic into `result`.
+__generic<T, U>
+[KnownBuiltin($( (int)KnownBuiltinDeclName::TryGetSemanticField))]
+bool tryGetSemanticField(T value, String semanticName, out U result);
+
+/// Attempts to read a field by semantic and index into `result`.
+__generic<T, U>
+[KnownBuiltin($( (int)KnownBuiltinDeclName::TryGetSemanticField))]
+bool tryGetSemanticField(T value, String semanticName, int semanticIndex, out U result);
+
+/// Attempts to write a field by semantic from `newValue`.
+__generic<T, U>
+[KnownBuiltin($( (int)KnownBuiltinDeclName::TrySetSemanticField))]
+bool trySetSemanticField(inout T value, String semanticName, U newValue);
+
+/// Attempts to write a field by semantic and index from `newValue`.
+__generic<T, U>
+[KnownBuiltin($( (int)KnownBuiltinDeclName::TrySetSemanticField))]
+bool trySetSemanticField(inout T value, String semanticName, int semanticIndex, U newValue);
+
 /// Use will produce a syntax error in downstream compiler
 /// Useful for testing diagnostics around compilation errors of downstream compiler
 /// It 'returns' an int so can be used in expressions without the front end complaining.
