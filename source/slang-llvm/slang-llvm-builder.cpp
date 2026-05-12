@@ -1723,9 +1723,11 @@ LLVMDebugNode* LLVMBuilder::getDebugVectorType(
 
     llvm::Metadata* subscript = llvmDebugBuilder->getOrCreateSubrange(0, elementCount);
     llvm::DINodeArray subscriptArray = llvmDebugBuilder->getOrCreateArray(subscript);
+    uint64_t sizeBits = sizeBytes > 0 ? static_cast<uint64_t>(sizeBytes) * 8 : 0;
+    uint64_t alignBits = alignBytes > 0 ? static_cast<uint64_t>(alignBytes) * 8 : 0;
     return llvmDebugBuilder->createVectorType(
-        sizeBytes * 8,
-        alignBytes * 8,
+        sizeBits,
+        alignBits,
         llvm::cast<llvm::DIType>(elementType),
         subscriptArray);
 }
@@ -1738,9 +1740,12 @@ LLVMDebugNode* LLVMBuilder::getDebugArrayType(
 {
     llvm::Metadata* subscript = llvmDebugBuilder->getOrCreateSubrange(0, elementCount);
     llvm::DINodeArray subscriptArray = llvmDebugBuilder->getOrCreateArray(subscript);
+    // Guard against invalid (negative) sizes from unsized/dynamically-sized types.
+    uint64_t sizeBits = sizeBytes > 0 ? static_cast<uint64_t>(sizeBytes) * 8 : 0;
+    uint64_t alignBits = alignBytes > 0 ? static_cast<uint64_t>(alignBytes) * 8 : 0;
     return llvmDebugBuilder->createArrayType(
-        sizeBytes * 8,
-        alignBytes * 8,
+        sizeBits,
+        alignBits,
         llvm::cast<llvm::DIType>(elementType),
         subscriptArray);
 }
@@ -1762,9 +1767,9 @@ LLVMDebugNode* LLVMBuilder::getDebugStructField(
         charSliceToLLVM(name),
         llvmFile,
         line,
-        size * 8,
-        alignment * 8,
-        offset * 8,
+        size > 0 ? static_cast<uint64_t>(size) * 8 : 0,
+        alignment > 0 ? static_cast<uint64_t>(alignment) * 8 : 0,
+        offset > 0 ? static_cast<uint64_t>(offset) * 8 : 0,
         llvm::DINode::FlagZero,
         llvm::cast<llvm::DIType>(type));
 }
@@ -1788,8 +1793,8 @@ LLVMDebugNode* LLVMBuilder::getDebugStructType(
         charSliceToLLVM(name),
         llvmFile,
         line,
-        size * 8,
-        alignment * 8,
+        size > 0 ? static_cast<uint64_t>(size) * 8 : 0,
+        alignment > 0 ? static_cast<uint64_t>(alignment) * 8 : 0,
         llvm::DINode::FlagZero,
         nullptr,
         fieldTypes);
@@ -2291,8 +2296,9 @@ SlangResult LLVMBuilder::generateJITLibrary(IArtifact** outArtifact)
 
     std::unique_ptr<llvm::orc::LLJIT> jit;
     {
-        llvm::orc::LLJITBuilder jitBuilder;
-        llvm::Expected<std::unique_ptr<llvm::orc::LLJIT>> expectJit = jitBuilder.create();
+        // Construct the LLJIT with AVX-512 disabled in the JIT TargetMachine;
+        // see #11062 and the docstring for createAVX512SafeLLJIT.
+        llvm::Expected<std::unique_ptr<llvm::orc::LLJIT>> expectJit = createAVX512SafeLLJIT();
 
         if (!expectJit)
         {

@@ -5,8 +5,9 @@
 #include "../core/slang-rtti-info.h"
 #include "../core/slang-shared-library.h"
 #include "../core/slang-signal.h"
-#include "../slang-record-replay/record/slang-global-session.h"
-#include "../slang-record-replay/util/record-utility.h"
+#include "../slang-record-replay/proxy/proxy-base.h"
+#include "../slang-record-replay/proxy/proxy-macros.h"
+#include "../slang-record-replay/replay-context.h"
 #include "slang-capability.h"
 #include "slang-compiler.h"
 #include "slang-internal.h"
@@ -245,18 +246,7 @@ SLANG_API SlangResult slang_createGlobalSessionImpl(
         }
     }
 
-    // Check if the SLANG_CAPTURE_ENABLE_ENV is enabled
-    if (SlangRecord::isRecordLayerEnabled())
-    {
-        SlangRecord::GlobalSessionRecorder* globalSessionRecorder =
-            new SlangRecord::GlobalSessionRecorder(desc, globalSession.detach());
-        Slang::ComPtr<SlangRecord::GlobalSessionRecorder> result(globalSessionRecorder);
-        *outGlobalSession = result.detach();
-    }
-    else
-    {
-        *outGlobalSession = globalSession.detach();
-    }
+    *outGlobalSession = globalSession.detach();
 
 #ifdef SLANG_ENABLE_IR_BREAK_ALLOC
     // Reset inst debug alloc counter to 0 so IRInsts for user code always starts from 0.
@@ -270,8 +260,21 @@ SLANG_API SlangResult slang_createGlobalSession2(
     const SlangGlobalSessionDesc* desc,
     slang::IGlobalSession** outGlobalSession)
 {
+    using namespace SlangRecord;
+    RECORD_STATIC_CALL();
+    RECORD_INPUT(*desc);
+
+    // Main internal call (regardless of replay state)
     Slang::GlobalSessionInternalDesc internalDesc = {};
-    return slang_createGlobalSessionImpl(desc, &internalDesc, outGlobalSession);
+    SlangResult result = slang_createGlobalSessionImpl(desc, &internalDesc, outGlobalSession);
+
+    // If replay system active, wrap output and record it
+    auto* wrapped = wrapObject(*outGlobalSession);
+    *outGlobalSession = static_cast<slang::IGlobalSession*>(wrapped);
+    _ctx.record(RecordFlag::Output, *outGlobalSession);
+    _ctx.record(RecordFlag::ReturnValue, result);
+
+    return result;
 }
 
 SLANG_API void slang_shutdown()
@@ -280,6 +283,50 @@ SLANG_API void slang_shutdown()
     Slang::SPIRVCoreGrammarInfo::freeEmbeddedGrammerInfo();
     Slang::RttiInfo::deallocateAll();
     Slang::freeCapabilityDefs();
+    SlangRecord::ReplayContext::destroySingleton();
+}
+
+SLANG_API void slang_enableRecordLayer(bool enable)
+{
+    if (enable)
+        SlangRecord::ReplayContext::get().setMode(SlangRecord::Mode::Record);
+    else
+        SlangRecord::ReplayContext::get().disable();
+}
+
+SLANG_API bool slang_isRecordLayerEnabled()
+{
+    return SlangRecord::ReplayContext::get().isActive();
+}
+
+SLANG_API void slang_setReplayDirectory(const char* path)
+{
+    SlangRecord::ReplayContext::get().setReplayDirectory(path);
+}
+
+SLANG_API const char* slang_getReplayDirectory()
+{
+    return SlangRecord::ReplayContext::get().getReplayDirectory();
+}
+
+SLANG_API const char* slang_getCurrentReplayPath()
+{
+    return SlangRecord::ReplayContext::get().getCurrentReplayPath();
+}
+
+SLANG_API SlangResult slang_loadReplay(const char* folderPath)
+{
+    return SlangRecord::ReplayContext::get().loadReplay(folderPath);
+}
+
+SLANG_API SlangResult slang_loadLatestReplay()
+{
+    return SlangRecord::ReplayContext::get().loadLatestReplay();
+}
+
+SLANG_API void slang_replayMarker(const char* label)
+{
+    SlangRecord::ReplayContext::get().marker(label);
 }
 
 SLANG_API SlangResult slang_createGlobalSessionWithoutCoreModule(
@@ -311,12 +358,17 @@ SLANG_API void spDestroySession(SlangSession* inSession)
     if (!inSession)
         return;
 
-    Slang::Session* session = Slang::asInternal(inSession);
+#ifdef _DEBUG
     // It is assumed there is only a single reference on the session (the one placed
-    // with spCreateSession) if this function is called
-    SLANG_ASSERT(session->debugGetReferenceCount() == 1);
+    // with spCreateSession) if this function is called.
+    // NOTE: When a replay is active Slang::asInternal skips the proxy, so this
+    // line checks the ref count on the internal object only.
+    Slang::Session* internalSession = Slang::asInternal(inSession);
+    SLANG_ASSERT(internalSession->debugGetReferenceCount() == 1);
+#endif
+
     // Release
-    session->release();
+    inSession->release();
 }
 
 SLANG_API const char* spGetBuildTagString()
@@ -1035,6 +1087,115 @@ SLANG_EXTERN_C SLANG_API ISlangBlob* slang_createBlob(const void* data, size_t s
     return blob.detach();
 }
 
+// JSON-escape one byte into `out`. Handles backslash, double-quote,
+// and the standard control-character escapes; falls back to \u00XX
+// for the remaining U+0000..U+001F range. Source paths can carry tabs
+// or newlines (e.g. from `#line` directives), so the full control
+// range is covered.
+static void _appendCoverageManifestJsonEscaped(Slang::StringBuilder& out, unsigned char uc)
+{
+    switch (uc)
+    {
+    case '\\':
+        out << "\\\\";
+        return;
+    case '"':
+        out << "\\\"";
+        return;
+    case '\b':
+        out << "\\b";
+        return;
+    case '\f':
+        out << "\\f";
+        return;
+    case '\n':
+        out << "\\n";
+        return;
+    case '\r':
+        out << "\\r";
+        return;
+    case '\t':
+        out << "\\t";
+        return;
+    }
+    if (uc < 0x20)
+    {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "\\u%04x", (unsigned)uc);
+        out << buf;
+        return;
+    }
+    out.appendChar((char)uc);
+}
+
+SLANG_EXTERN_C SLANG_API SlangResult
+slang_writeCoverageManifestJson(slang::ICoverageTracingMetadata* metadata, ISlangBlob** outBlob)
+{
+    if (!metadata || !outBlob)
+        return SLANG_E_INVALID_ARG;
+
+    Slang::StringBuilder out;
+    out << "{\n";
+    out << "  \"version\": 1,\n";
+    uint32_t counterCount = metadata->getCounterCount();
+    out << "  \"counters\": " << (int64_t)counterCount << ",\n";
+    out << "  \"buffer\": {\n";
+    out << "    \"name\": \"__slang_coverage\",\n";
+    out << "    \"element_type\": \"uint32\",\n";
+    out << "    \"element_stride\": 4";
+    slang::CoverageBufferInfo bufferInfo;
+    // `bufferInfo.structSize` is set by the default constructor; a
+    // failure here is an internal-invariant violation, not a "fields
+    // unavailable" case. Bail rather than silently producing a
+    // manifest without binding info — hosts that rely on the binding
+    // would parse a partial sidecar without realizing it.
+    SLANG_RETURN_ON_FAIL(metadata->getBufferInfo(&bufferInfo));
+    if (bufferInfo.space >= 0)
+        out << ",\n    \"space\": " << (int64_t)bufferInfo.space;
+    if (bufferInfo.binding >= 0)
+        out << ",\n    \"binding\": " << (int64_t)bufferInfo.binding;
+    out << "\n  },\n";
+    out << "  \"entries\": [";
+    for (uint32_t i = 0; i < counterCount; ++i)
+    {
+        slang::CoverageEntryInfo entry;
+        // Every index in [0, counterCount) is a valid argument to
+        // `getEntryInfo` by construction; failure here means an
+        // internal invariant violation. Bail rather than silently
+        // dropping entries — a partial manifest with out-of-order
+        // slot indices would misalign the host's counter array.
+        if (SLANG_FAILED(metadata->getEntryInfo(i, &entry)))
+            return SLANG_FAIL;
+        out << (i == 0 ? "" : ",");
+        out << "\n    {\"index\": " << (int64_t)i << ", \"file\": ";
+        // Mirror the C++ API's nullable contract: `getEntryInfo`
+        // returns `entry.file == nullptr` for unattributable slots,
+        // so the JSON manifest emits `null` (not `""`) for the same
+        // case. A strict consumer that distinguishes "missing source"
+        // from "empty path" sees the same shape from both channels.
+        if (!entry.file)
+        {
+            out << "null";
+        }
+        else
+        {
+            out << "\"";
+            for (const char* p = entry.file; *p; ++p)
+                _appendCoverageManifestJsonEscaped(out, (unsigned char)*p);
+            out << "\"";
+        }
+        out << ", \"line\": " << (int64_t)entry.line << "}";
+    }
+    out << "\n  ]\n";
+    out << "}\n";
+
+    Slang::ComPtr<ISlangBlob> blob = Slang::StringBlob::create(out.toString());
+    if (!blob)
+        return SLANG_E_OUT_OF_MEMORY;
+    *outBlob = blob.detach();
+    return SLANG_OK;
+}
+
 /* !!!!!!!!!!!!!!!!!!!!!!!!!!!!! Module Loading !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! */
 
 SLANG_EXTERN_C SLANG_API slang::IModule* slang_loadModuleFromSource(
@@ -1050,7 +1211,7 @@ SLANG_EXTERN_C SLANG_API slang::IModule* slang_loadModuleFromSource(
 
     // Create a blob from the source data using the slang_createBlob function.
     Slang::ComPtr<ISlangBlob> sourceBlob;
-    sourceBlob = slang_createBlob(source, sourceSize);
+    sourceBlob.attach(slang_createBlob(source, sourceSize));
     if (!sourceBlob)
         return nullptr;
 
@@ -1071,7 +1232,7 @@ SLANG_EXTERN_C SLANG_API slang::IModule* slang_loadModuleFromIRBlob(
 
     // Create a blob from the source data using the slang_createBlob function.
     Slang::ComPtr<ISlangBlob> sourceBlob;
-    sourceBlob = slang_createBlob(source, sourceSize);
+    sourceBlob.attach(slang_createBlob(source, sourceSize));
     if (!sourceBlob)
         return nullptr;
 
@@ -1092,7 +1253,7 @@ SLANG_EXTERN_C SLANG_API SlangResult slang_loadModuleInfoFromIRBlob(
 
     // Create a blob from the source data using the slang_createBlob function.
     Slang::ComPtr<ISlangBlob> sourceBlob;
-    sourceBlob = slang_createBlob(source, sourceSize);
+    sourceBlob.attach(slang_createBlob(source, sourceSize));
     if (!sourceBlob)
         return SLANG_E_INVALID_ARG;
 

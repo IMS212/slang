@@ -146,7 +146,7 @@ Session::~Session()
     //
     coreModules = decltype(coreModules)();
 
-    if (getCurrentASTBuilder() == m_rootASTBuilder)
+    if (getCurrentASTBuilder() == m_rootASTBuilder.get())
         setCurrentASTBuilder(nullptr);
 }
 
@@ -1034,7 +1034,7 @@ SlangPassThrough Session::getDownstreamCompilerForTransition(
          source == CodeGenTarget::CPPHeader))
     {
         // We prefer LLVM if it's available
-        if (const auto llvm = getOrLoadDownstreamCompiler(PassThroughMode::LLVM, nullptr))
+        if (const auto llvm = getOrLoadDownstreamCompiler(PassThroughMode::LLVM, nullptr); llvm)
         {
             return SLANG_PASS_THROUGH_LLVM;
         }

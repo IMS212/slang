@@ -419,6 +419,12 @@ struct GLSLBaseLayoutRulesImpl : DefaultLayoutRulesImpl
         size_t elementCount) override
     {
         SLANG_UNUSED(elementType);
+        if (elementInfo.kind != LayoutResourceKind::Uniform)
+        {
+            auto arrayInfo = GetArrayLayout(elementInfo, LayoutSize(elementCount));
+            return SimpleLayoutInfo(arrayInfo.kind, arrayInfo.size, arrayInfo.alignment);
+        }
+
         // The `std140` and `std430` rules require vectors to be aligned to the next power of
         // two up from their size (so a `float2` is 8-byte aligned, and a `float3` is
         // 16-byte aligned).
@@ -2575,6 +2581,9 @@ struct MetalObjectLayoutRulesImpl : ObjectLayoutRulesImpl
         case ShaderParameterKind::Texture:
             return SimpleLayoutInfo(LayoutResourceKind::MetalTexture, 1);
 
+        case ShaderParameterKind::SubpassInput:
+            return SimpleLayoutInfo(LayoutResourceKind::InputAttachmentIndex, 1);
+
         case ShaderParameterKind::SamplerState:
             return SimpleLayoutInfo(LayoutResourceKind::SamplerState, 1);
 
@@ -2644,6 +2653,8 @@ struct MetalArgumentBufferElementLayoutRulesImpl : ObjectLayoutRulesImpl, Defaul
             {
                 return SimpleLayoutInfo(LayoutResourceKind::MetalArgumentBufferElement, 2);
             }
+        case ShaderParameterKind::SubpassInput:
+            return SimpleLayoutInfo(LayoutResourceKind::MetalArgumentBufferElement, 1);
         default:
             SLANG_UNEXPECTED("unhandled shader parameter kind");
             UNREACHABLE_RETURN(SimpleLayoutInfo());
@@ -2679,6 +2690,8 @@ struct MetalTier2ObjectLayoutRulesImpl : ObjectLayoutRulesImpl
         case ShaderParameterKind::TextureSampler:
         case ShaderParameterKind::MutableTextureSampler:
             return SimpleLayoutInfo(LayoutResourceKind::Uniform, 16, 8);
+        case ShaderParameterKind::SubpassInput:
+            return SimpleLayoutInfo(LayoutResourceKind::InputAttachmentIndex, 1);
         default:
             SLANG_UNEXPECTED("unhandled shader parameter kind");
             UNREACHABLE_RETURN(SimpleLayoutInfo());
@@ -3042,7 +3055,7 @@ static LayoutSize GetElementCount(IntVal* val)
             return LayoutSize::infinite();
         return LayoutSize(LayoutSize::RawValue(constantVal->getValue()));
     }
-    else if (const auto varRefVal = as<DeclRefIntVal>(val))
+    else if (const auto varRefVal = as<DeclRefIntVal>(val); varRefVal)
     {
         // TODO: We want to treat the case where the number of
         // elements in an array depends on a generic parameter
@@ -3054,7 +3067,7 @@ static LayoutSize GetElementCount(IntVal* val)
         //
         return LayoutSize::invalid();
     }
-    else if (const auto polyIntVal = as<PolynomialIntVal>(val))
+    else if (const auto polyIntVal = as<PolynomialIntVal>(val); polyIntVal)
     {
         return LayoutSize::invalid();
     }
@@ -3615,7 +3628,8 @@ RefPtr<TypeLayout> applyOffsetToTypeLayout(
     bool anyHit = false;
     for (auto oldResInfo : oldTypeLayout->resourceInfos)
     {
-        if (const auto offsetResInfo = offsetVarLayout->FindResourceInfo(oldResInfo.kind))
+        if (const auto offsetResInfo = offsetVarLayout->FindResourceInfo(oldResInfo.kind);
+            offsetResInfo)
         {
             anyHit = true;
             break;
@@ -3711,7 +3725,8 @@ IRTypeLayout* applyOffsetToTypeLayout(
     for (auto oldResInfo : oldTypeLayout->getSizeAttrs())
     {
         if (const auto offsetResInfo =
-                offsetVarLayout->findOffsetAttr(oldResInfo->getResourceKind()))
+                offsetVarLayout->findOffsetAttr(oldResInfo->getResourceKind());
+            offsetResInfo)
         {
             anyHit = true;
             break;
@@ -4439,6 +4454,8 @@ static TypeLayoutResult _createTypeLayout(
     Decl* declForModifiers)
 {
     TypeLayoutContext subContext = context;
+    if (!subContext.layoutDeclForDiagnostics)
+        subContext.layoutDeclForDiagnostics = declForModifiers;
 
     if (declForModifiers)
     {
@@ -5257,6 +5274,27 @@ static TypeLayoutResult _updateLayout(
 
 static TypeLayoutResult _createTypeLayout(TypeLayoutContext& context, Type* type)
 {
+    if (context.recursionDepth >= kMaxTypeNestingDepth)
+    {
+        if (context.sink)
+        {
+            Diagnostics::MaximumTypeNestingLevelExceeded diag = {};
+            diag.location =
+                context.layoutDeclForDiagnostics
+                    ? _getTypeNestingDiagnosticPosForDecl(context.layoutDeclForDiagnostics)
+                    : SourceLoc();
+            context.sink->diagnose(diag);
+        }
+        // Return a layout with unknown size, if we run out of recursion depth.
+        ObjectLayoutInfo info;
+        info.layoutInfos.add(
+            SimpleLayoutInfo(UniformLayoutInfo(LayoutSize::invalid(), LayoutOffset(1))));
+        return createSimpleTypeLayout(info, type, context.rules);
+    }
+
+    context.recursionDepth++;
+    SLANG_DEFER(context.recursionDepth--);
+
     if (auto layoutResultPtr = context.layoutMap.tryGetValue(type))
     {
         return *layoutResultPtr;
@@ -5426,9 +5464,9 @@ static TypeLayoutResult _createTypeLayout(TypeLayoutContext& context, Type* type
 
         // Handle conditionally-sized vectors (e.g., 0-length vectors or non-constant sizes)
         auto elementCountVal = context.tryResolveLinkTimeVal(vecType->getElementCount());
-        if (!as<ConstantIntVal>(elementCountVal))
+        if (!as<ConstantIntVal>(elementCountVal) || getIntVal(elementCountVal) == 0)
         {
-            // If the vector size is not a compile-time constant, fall back to default layout
+            // Fall back to default layout
             auto element = _createTypeLayout(context, elementType);
             RefPtr<TypeLayout> typeLayout = new TypeLayout();
             typeLayout->type = type;
@@ -5524,7 +5562,12 @@ static TypeLayoutResult _createTypeLayout(TypeLayoutContext& context, Type* type
 
         rowTypeLayout->type = rowType;
         rowTypeLayout->rules = rules;
-        rowTypeLayout->uniformAlignment = elementInfo.getUniformLayout().alignment;
+        // The row vector is an element of the matrix, so its alignment in this context is the
+        // matrix's array alignment (e.g. 16 bytes for std140 / HLSL constant buffers, where every
+        // row is aligned up to a 16-byte boundary).  Using the scalar element's alignment here
+        // would cause `getStride()` on the row vector to report the natural vector size (e.g. 12
+        // for a `float3`) instead of the matrix element stride (16).
+        rowTypeLayout->uniformAlignment = info.alignment;
 
         rowTypeLayout->uniformStride = colStride;
         rowTypeLayout->elementTypeLayout = elementTypeLayout;
@@ -5703,6 +5746,22 @@ static TypeLayoutResult _createTypeLayout(TypeLayoutContext& context, Type* type
 
         auto declRef = declRefType->getDeclRef();
 
+        if (auto conditionalType = as<ConditionalType>(declRefType))
+        {
+            auto hasValue = conditionalType->getHasValue();
+            auto hasValueVal = hasValue ? context.tryResolveLinkTimeVal(hasValue) : nullptr;
+            if (auto constVal = as<ConstantIntVal>(hasValueVal))
+            {
+                if (getIntVal(constVal) != 0)
+                    return _createTypeLayout(context, conditionalType->getValueType());
+            }
+            RefPtr<TypeLayout> typeLayout = new TypeLayout();
+            typeLayout->type = type;
+            typeLayout->rules = rules;
+            _addLayout(context, type, typeLayout);
+            return TypeLayoutResult(typeLayout, SimpleLayoutInfo());
+        }
+
         if (auto structDeclRef = declRef.as<StructDecl>())
         {
             StructTypeLayoutBuilder typeLayoutBuilder;
@@ -5730,8 +5789,9 @@ static TypeLayoutResult _createTypeLayout(TypeLayoutContext& context, Type* type
                 // If the field has an explicit offset, then we will
                 // use that to place it.
                 //
-                if (const auto packOffsetModifier =
-                        field.getDecl()->findModifier<HLSLPackOffsetSemantic>())
+                if (auto packOffsetModifier =
+                        field.getDecl()->findModifier<HLSLPackOffsetSemantic>();
+                    packOffsetModifier)
                 {
                     TypeLayoutResult fieldResult = _createTypeLayout(
                         context,
@@ -5744,8 +5804,9 @@ static TypeLayoutResult _createTypeLayout(TypeLayoutContext& context, Type* type
             for (auto field :
                  getFields(context.astBuilder, structDeclRef, MemberFilterStyle::Instance))
             {
-                if (const auto packOffsetModifier =
-                        field.getDecl()->findModifier<HLSLPackOffsetSemantic>())
+                if (auto packOffsetModifier =
+                        field.getDecl()->findModifier<HLSLPackOffsetSemantic>();
+                    packOffsetModifier)
                     continue;
 
                 // The fields of a `struct` type may include existential (interface)
@@ -5784,6 +5845,19 @@ static TypeLayoutResult _createTypeLayout(TypeLayoutContext& context, Type* type
             typeLayoutBuilder.endLayout();
 
             return _updateLayout(context, type, typeLayoutBuilder.getTypeLayoutResult());
+        }
+        else if (auto classDeclRef = declRef.as<ClassDecl>())
+        {
+            if (context.sink)
+            {
+                auto name = classDeclRef.getName();
+                context.sink->diagnose(Diagnostics::ClassTypeNotSupported{
+                    .name = name ? String(name->text) : String("(anonymous)"),
+                    .location = context.layoutDeclForDiagnostics
+                                    ? context.layoutDeclForDiagnostics->loc
+                                    : classDeclRef.getLoc()});
+            }
+            return createSimpleTypeLayout(SimpleLayoutInfo(), type, rules);
         }
         else if (auto globalGenericParamDecl = declRef.as<GlobalGenericParamDecl>())
         {
@@ -6008,6 +6082,9 @@ static TypeLayoutResult _createTypeLayout(TypeLayoutContext& context, Type* type
                         break;
                     }
                 }
+                // TODO: PR #1612 (Theresa Foley) - fits is computed but never used.
+                // The intended use was to branch on fits to select storage strategy.
+                SLANG_UNUSED(fits);
             }
             // Interface type occupies a uniform slot for the fixed size storage, with alignment of
             // 4 bytes.
@@ -6147,7 +6224,7 @@ RefPtr<TypeLayout> getSimpleVaryingParameterTypeLayout(
 
         // Handle conditionally-sized vectors (e.g., 0-length vectors or non-constant sizes)
         auto elementCountVal = context.tryResolveLinkTimeVal(vecType->getElementCount());
-        if (!as<ConstantIntVal>(elementCountVal))
+        if (!as<ConstantIntVal>(elementCountVal) || getIntVal(elementCountVal) == 0)
         {
             // If the vector size is not a compile-time constant, we cannot
             // compute a fixed layout for it. Treat it as having zero size.

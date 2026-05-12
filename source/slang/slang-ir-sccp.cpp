@@ -2,6 +2,7 @@
 #include "slang-ir-sccp.h"
 
 #include "slang-ir-insts.h"
+#include "slang-ir-translate.h"
 #include "slang-ir.h"
 #include "slang-rich-diagnostics.h"
 
@@ -19,6 +20,7 @@ struct SharedSCCPContext
     IRModule* module;
     TargetProgram* targetProgram;
     DiagnosticSink* sink;
+    TranslationContext* translationContext = nullptr;
 };
 //
 // Next we have a context struct that will be applied for each function (or other
@@ -296,7 +298,15 @@ struct SCCPContext
             // value, rather than the default of none.
             //
             if (!parentBlock || parentBlock->getParent() != code)
+            {
+                if (!parentBlock && shared->translationContext)
+                {
+                    auto resolvedInst = shared->translationContext->resolveInst(inst);
+                    if (resolvedInst != inst)
+                        return getLatticeVal(resolvedInst);
+                }
                 return LatticeVal::getAny();
+            }
         }
 
         return LatticeVal::getNone();
@@ -602,7 +612,12 @@ struct SCCPContext
             type,
             v0,
             v1,
-            [](IRIntegerValue c0, IRIntegerValue c1) { return c0 + c1; },
+            [](IRIntegerValue c0, IRIntegerValue c1)
+            {
+                return static_cast<IRIntegerValue>(
+                    static_cast<IRUnsignedIntegerValue>(c0) +
+                    static_cast<IRUnsignedIntegerValue>(c1));
+            },
             [](IRUnsignedIntegerValue c0, IRUnsignedIntegerValue c1) { return c0 + c1; },
             [](IRFloatingPointValue c0, IRFloatingPointValue c1) { return c0 + c1; });
     }
@@ -612,7 +627,12 @@ struct SCCPContext
             type,
             v0,
             v1,
-            [](IRIntegerValue c0, IRIntegerValue c1) { return c0 - c1; },
+            [](IRIntegerValue c0, IRIntegerValue c1)
+            {
+                return static_cast<IRIntegerValue>(
+                    static_cast<IRUnsignedIntegerValue>(c0) -
+                    static_cast<IRUnsignedIntegerValue>(c1));
+            },
             [](IRUnsignedIntegerValue c0, IRUnsignedIntegerValue c1) { return c0 - c1; },
             [](IRFloatingPointValue c0, IRFloatingPointValue c1) { return c0 - c1; });
     }
@@ -622,7 +642,12 @@ struct SCCPContext
             type,
             v0,
             v1,
-            [](IRIntegerValue c0, IRIntegerValue c1) { return c0 * c1; },
+            [](IRIntegerValue c0, IRIntegerValue c1)
+            {
+                return static_cast<IRIntegerValue>(
+                    static_cast<IRUnsignedIntegerValue>(c0) *
+                    static_cast<IRUnsignedIntegerValue>(c1));
+            },
             [](IRUnsignedIntegerValue c0, IRUnsignedIntegerValue c1) { return c0 * c1; },
             [](IRFloatingPointValue c0, IRFloatingPointValue c1) { return c0 * c1; });
     }
@@ -750,6 +775,10 @@ struct SCCPContext
     }
     LatticeVal evalLsh(IRType* type, LatticeVal v0, LatticeVal v1)
     {
+        const auto bitWidthOpt = maybeGetIntTypeWidth(type);
+        const IRUnsignedIntegerValue bitWidth =
+            bitWidthOpt ? static_cast<IRUnsignedIntegerValue>(*bitWidthOpt)
+                        : std::numeric_limits<IRUnsignedIntegerValue>::digits;
         bool isSigned = getIntTypeSigned(type);
         if (isSigned == false)
         {
@@ -757,16 +786,32 @@ struct SCCPContext
                 type,
                 v0,
                 v1,
-                [](IRUnsignedIntegerValue c0, IRUnsignedIntegerValue c1) { return c0 << c1; });
+                [bitWidth](IRUnsignedIntegerValue c0, IRUnsignedIntegerValue c1)
+                {
+                    if (c1 >= bitWidth)
+                        return IRUnsignedIntegerValue(0);
+                    return c0 << c1;
+                });
         }
         return evalBinaryIntImpl(
             type,
             v0,
             v1,
-            [](IRIntegerValue c0, IRIntegerValue c1) { return c0 << c1; });
+            [bitWidth](IRIntegerValue c0, IRIntegerValue c1)
+            {
+                if (static_cast<IRUnsignedIntegerValue>(c1) >= bitWidth)
+                    return IRIntegerValue(0);
+                return static_cast<IRIntegerValue>(
+                    static_cast<IRUnsignedIntegerValue>(c0)
+                    << static_cast<IRUnsignedIntegerValue>(c1));
+            });
     }
     LatticeVal evalRsh(IRType* type, LatticeVal v0, LatticeVal v1)
     {
+        const auto bitWidthOpt = maybeGetIntTypeWidth(type);
+        const IRUnsignedIntegerValue bitWidth =
+            bitWidthOpt ? static_cast<IRUnsignedIntegerValue>(*bitWidthOpt)
+                        : std::numeric_limits<IRUnsignedIntegerValue>::digits;
         bool isSigned = getIntTypeSigned(type);
         if (isSigned == false)
         {
@@ -774,13 +819,23 @@ struct SCCPContext
                 type,
                 v0,
                 v1,
-                [](IRUnsignedIntegerValue c0, IRUnsignedIntegerValue c1) { return c0 >> c1; });
+                [bitWidth](IRUnsignedIntegerValue c0, IRUnsignedIntegerValue c1)
+                {
+                    if (c1 >= bitWidth)
+                        return IRUnsignedIntegerValue(0);
+                    return c0 >> c1;
+                });
         }
         return evalBinaryIntImpl(
             type,
             v0,
             v1,
-            [](IRIntegerValue c0, IRIntegerValue c1) { return c0 >> c1; });
+            [bitWidth](IRIntegerValue c0, IRIntegerValue c1)
+            {
+                if (static_cast<IRUnsignedIntegerValue>(c1) >= bitWidth)
+                    return (c0 < 0) ? IRIntegerValue(-1) : IRIntegerValue(0);
+                return c0 >> static_cast<IRUnsignedIntegerValue>(c1);
+            });
     }
     LatticeVal evalNeg(IRType* type, LatticeVal v0)
     {
@@ -1203,7 +1258,7 @@ struct SCCPContext
         // since abstract interpretation of them should cause blocks to
         // be marked as executed, etc.
         //
-        if (const auto terminator = as<IRTerminatorInst>(inst))
+        if (const auto terminator = as<IRTerminatorInst>(inst); terminator)
         {
             if (auto unconditionalBranch = as<IRUnconditionalBranch>(inst))
             {
@@ -1471,26 +1526,25 @@ struct SCCPContext
 
         bool changed = false;
         // Replace the insts with their values.
-        List<IRInst*> instsToRemove;
+
+        List<IRInst*> instsToProcess;
         for (auto child : scopeInst->getChildren())
         {
             if (!isEvaluableOpCode(child->getOp()))
                 continue;
+            instsToProcess.add(child);
+        }
 
+        for (auto child : instsToProcess)
+        {
             auto latticeVal = getLatticeVal(child);
             if (latticeVal.flavor == LatticeVal::Flavor::Constant && latticeVal.value != child)
             {
                 child->replaceUsesWith(latticeVal.value);
-                instsToRemove.add(child);
+                child->removeAndDeallocate();
             }
         }
 
-        if (instsToRemove.getCount())
-        {
-            changed = true;
-            for (auto inst : instsToRemove)
-                inst->removeAndDeallocate();
-        }
         return changed;
     }
 
@@ -1931,7 +1985,8 @@ bool applySparseConditionalConstantPropagationForGlobalScope(
 bool applySparseConditionalConstantPropagation(
     IRInst* func,
     TargetProgram* targetProgram,
-    DiagnosticSink* sink)
+    DiagnosticSink* sink,
+    TranslationContext* translationContext)
 {
     if (sink && sink->getErrorCount())
         return false;
@@ -1940,6 +1995,7 @@ bool applySparseConditionalConstantPropagation(
     shared.module = func->getModule();
     shared.targetProgram = targetProgram;
     shared.sink = sink;
+    shared.translationContext = translationContext;
 
     SCCPContext globalContext;
     globalContext.shared = &shared;
@@ -1965,6 +2021,60 @@ IRInst* tryConstantFoldInst(IRModule* module, TargetProgram* targetProgram, IRIn
     }
     inst->replaceUsesWith(foldResult.value);
     return foldResult.value;
+}
+
+bool isEvaluableOpCode(IROp op)
+{
+    switch (op)
+    {
+    case kIROp_IntLit:
+    case kIROp_BoolLit:
+    case kIROp_FloatLit:
+    case kIROp_StringLit:
+    case kIROp_Add:
+    case kIROp_Sub:
+    case kIROp_Mul:
+    case kIROp_Div:
+    case kIROp_Neg:
+    case kIROp_Not:
+    case kIROp_Eql:
+    case kIROp_Neq:
+    case kIROp_Leq:
+    case kIROp_Geq:
+    case kIROp_Less:
+    case kIROp_And:
+    case kIROp_Or:
+    case kIROp_IRem:
+    case kIROp_FRem:
+    case kIROp_Greater:
+    case kIROp_Lsh:
+    case kIROp_Rsh:
+    case kIROp_BitAnd:
+    case kIROp_BitOr:
+    case kIROp_BitXor:
+    case kIROp_BitNot:
+    case kIROp_BitCast:
+    case kIROp_CastIntToFloat:
+    case kIROp_CastFloatToInt:
+    case kIROp_IntCast:
+    case kIROp_FloatCast:
+    case kIROp_Select:
+    case kIROp_ConstexprAdd:
+    case kIROp_ConstexprSub:
+    case kIROp_ConstexprMul:
+    case kIROp_ConstexprDiv:
+    case kIROp_ConstexprNeg:
+    case kIROp_ConstexprIntCast:
+    case kIROp_ConstexprCastIntToFloat:
+    case kIROp_ConstexprCastFloatToInt:
+    case kIROp_ConstexprFloatCast:
+    case kIROp_ConstexprCastIntToEnum:
+    case kIROp_ConstexprCastEnumToInt:
+    case kIROp_ConstexprEnumCast:
+        return true;
+    default:
+        return false;
+    }
 }
 
 } // namespace Slang
