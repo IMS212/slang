@@ -2082,7 +2082,11 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 return 0;
 
             if (auto strideInst = arrayType->getArrayStride())
+            {
+                if (arrayType->getOp() == kIROp_ArrayType)
+                    return 0;
                 return getIntVal(strideInst);
+            }
 
             if (arrayType->getOp() == kIROp_UnsizedArrayType)
             {
@@ -2104,11 +2108,8 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         return 0;
     }
 
-    // Returns 0 when no ArrayStride decoration should be emitted.
-    SpvWord getArrayStrideDecorationValue(IRInst* inst)
+    SpvWord getArrayStrideDecorationValueFromStride(IRIntegerValue stride)
     {
-        auto stride = getArrayStrideValue(inst);
-
         if (stride == IRSizeAndAlignment::kIndeterminateSize)
         {
             // Any unsized data type (e.g. struct or array) will have size of
@@ -2120,6 +2121,12 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         // TODO: Diagnose strides outside the 32-bit SPIR-V ArrayStride literal range.
 
         return SpvWord(uint32_t(stride));
+    }
+
+    // Returns 0 when no ArrayStride decoration should be emitted.
+    SpvWord getArrayStrideDecorationValue(IRInst* inst)
+    {
+        return getArrayStrideDecorationValueFromStride(getArrayStrideValue(inst));
     }
 
     void addArrayStrideExtraKeyData(List<SpvWord>& extraKeyData, IRIntegerValue stride)
@@ -2494,7 +2501,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 }
                 else
                 {
-                    auto spvValueType = ensureInst(valueType);
+                    auto spvValueType = ensureInstForPointerValueType(ptrType, storageClass);
                     valueTypeId = getID(spvValueType);
                 }
 
@@ -2530,18 +2537,35 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             SLANG_UNEXPECTED("Constant buffer type remaining in spirv emit");
         case kIROp_StructType:
             {
-                List<IRType*> types;
-                for (auto field : static_cast<IRStructType*>(inst)->getFields())
-                {
-                    types.add(field->getFieldType());
-                }
-
                 maybeAssignAnonymousMemberNames(as<IRStructType>(inst));
 
-                auto spvStructType = emitOpTypeStruct(inst, types);
+                auto structType = as<IRStructType>(inst);
+                auto isPhysicalType = isPhysicalCompositeType(structType);
+
+                SpvInst* spvStructType = nullptr;
+                if (isPhysicalType)
+                {
+                    List<SpvInst*> types;
+                    IRTypeLayoutRuleName layoutRuleName = IRTypeLayoutRuleName::Natural;
+                    tryGetPreferredSizeAndAlignmentLayoutRuleName(structType, &layoutRuleName);
+                    auto rule = IRTypeLayoutRules::get(layoutRuleName);
+                    for (auto field : structType->getFields())
+                    {
+                        types.add(ensureInstForPhysicalFieldType(field->getFieldType(), rule));
+                    }
+                    spvStructType = emitOpTypeStruct(inst, types);
+                }
+                else
+                {
+                    List<IRType*> types;
+                    for (auto field : structType->getFields())
+                    {
+                        types.add(field->getFieldType());
+                    }
+                    spvStructType = emitOpTypeStruct(inst, types);
+                }
                 emitDecorations(inst, getID(spvStructType));
 
-                auto structType = as<IRStructType>(inst);
                 uint64_t structSize = 0;
                 if (auto layoutDecor = structType->findDecoration<IRSizeAndAlignmentDecoration>())
                 {
@@ -6896,6 +6920,89 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         return false;
     }
 
+    SpvInst* ensureLayoutDecoratedArrayType(IRArrayTypeBase* arrayType, IRIntegerValue strideValue)
+    {
+        auto stride = getArrayStrideDecorationValueFromStride(strideValue);
+        if (stride == 0)
+            return ensureInst(arrayType);
+
+        List<SpvWord> extraKeyData;
+        addArrayStrideExtraKeyData(extraKeyData, strideValue);
+
+        SpvInst* spvArrayType = nullptr;
+        if (arrayType->getOp() == kIROp_ArrayType)
+        {
+            spvArrayType = emitInstMemoizedWithExtraKeyData(
+                getSection(SpvLogicalSectionID::ConstantsAndTypes),
+                nullptr,
+                SpvOpTypeArray,
+                kResultID,
+                std::move(extraKeyData),
+                arrayType->getElementType(),
+                arrayType->getElementCount());
+        }
+        else
+        {
+            spvArrayType = emitInstMemoizedWithExtraKeyData(
+                getSection(SpvLogicalSectionID::ConstantsAndTypes),
+                nullptr,
+                SpvOpTypeRuntimeArray,
+                kResultID,
+                std::move(extraKeyData),
+                arrayType->getElementType());
+        }
+
+        if (m_decoratedSpvInsts.add(getID(spvArrayType)))
+        {
+            emitOpDecorateArrayStride(
+                getSection(SpvLogicalSectionID::Annotations),
+                nullptr,
+                spvArrayType,
+                SpvLiteralInteger::from32(stride));
+        }
+        return spvArrayType;
+    }
+
+    SpvInst* ensureInstForPhysicalFieldType(IRType* type, IRTypeLayoutRules* rule)
+    {
+        auto unwrappedType = (IRType*)unwrapAttributedType(type);
+        if (auto arrayType = as<IRArrayTypeBase>(unwrappedType))
+        {
+            if (arrayType->getOp() == kIROp_ArrayType)
+            {
+                auto stride = getArrayElementStrideValue(arrayType, rule);
+                if (stride != 0)
+                    return ensureLayoutDecoratedArrayType(arrayType, stride);
+            }
+        }
+        return ensureInst(type);
+    }
+
+    SpvInst* ensureInstForPointerValueType(IRPtrTypeBase* ptrType, SpvStorageClass storageClass)
+    {
+        auto valueType = ptrType->getValueType();
+        switch (storageClass)
+        {
+        case SpvStorageClassPhysicalStorageBuffer:
+        case SpvStorageClassStorageBuffer:
+            if (auto arrayType = as<IRArrayTypeBase>(unwrapAttributedType(valueType)))
+            {
+                if (arrayType->getOp() == kIROp_ArrayType)
+                {
+                    auto rule = getPointerArrayStrideLayoutRule(ptrType, valueType);
+                    auto stride = getArrayElementStrideValue(arrayType, rule);
+                    if (stride != 0)
+                        return ensureLayoutDecoratedArrayType(arrayType, stride);
+                }
+            }
+            break;
+        default:
+            break;
+        }
+
+        return ensureInst(valueType);
+    }
+
     void maybeEmitArrayStrideDecorationForPhysicalFieldType(IRType* type, IRTypeLayoutRules* rule)
     {
         type = (IRType*)unwrapAttributedType(type);
@@ -6907,23 +7014,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         if (!isIROpaqueType(elementType) && shouldEmitArrayStride(elementType) &&
             arrayType->getOp() == kIROp_ArrayType && !arrayType->getArrayStride())
         {
-            auto spvArrayType = ensureInst(arrayType);
-            auto spvArrayTypeId = getID(spvArrayType);
-            if (m_decoratedSpvInsts.add(spvArrayTypeId))
-            {
-                IRSizeAndAlignment elementSizeAndAlignment;
-                getSizeAndAlignment(m_targetRequest, rule, elementType, &elementSizeAndAlignment);
-                auto alignedElement = rule->alignCompositeElement(elementSizeAndAlignment);
-                auto stride = (int32_t)alignedElement.getStride();
-                if (stride > 0)
-                {
-                    emitOpDecorateArrayStride(
-                        getSection(SpvLogicalSectionID::Annotations),
-                        nullptr,
-                        spvArrayType,
-                        SpvLiteralInteger::from32((uint32_t)stride));
-                }
-            }
+            ensureLayoutDecoratedArrayType(arrayType, getArrayElementStrideValue(arrayType, rule));
         }
 
         // Handle nested arrays (e.g., array-of-array) recursively.
