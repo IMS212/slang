@@ -8,7 +8,6 @@
 #include "core/slang-memory-file-system.h"
 #include "slang-check-impl.h"
 #include "slang-compiler.h"
-#include "slang-ir-lower-bindless-resources.h"
 #include "slang-lookup.h"
 #include "slang-mangle.h"
 #include "slang-rich-diagnostics.h"
@@ -109,14 +108,10 @@ ISlangUnknown* ComponentType::getInterface(Guid const& guid)
         return static_cast<slang::IModulePrecompileService_Experimental*>(this);
     if (guid == IComponentType2::getTypeGuid())
         return static_cast<slang::IComponentType2*>(this);
-    if (guid == IComponentType3::getTypeGuid())
-        return static_cast<slang::IComponentType3*>(this);
-    if (guid == IComponentType4::getTypeGuid())
-        return static_cast<slang::IComponentType4*>(this);
-    if (guid == IComponentType5::getTypeGuid())
-        return static_cast<slang::IComponentType5*>(this);
     if (guid == IComponentType6::getTypeGuid())
         return static_cast<slang::IComponentType6*>(this);
+    if (guid == IComponentType7::getTypeGuid())
+        return static_cast<slang::IComponentType7*>(this);
     return nullptr;
 }
 
@@ -571,79 +566,6 @@ SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::getTargetCompileResult(
     return SLANG_OK;
 }
 
-SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::setBindlessResourceIndexMap(
-    Int targetIndex,
-    const char* const* names,
-    const SlangInt* indices,
-    SlangInt count)
-{
-    auto linkage = getLinkage();
-    if (targetIndex < 0 || targetIndex >= linkage->targets.getCount())
-        return SLANG_E_INVALID_ARG;
-
-    auto target = linkage->targets[targetIndex];
-    auto targetProgram = getTargetProgram(target);
-
-    Dictionary<String, int> map;
-    for (SlangInt i = 0; i < count; i++)
-    {
-        map.set(String(names[i]), (int)indices[i]);
-    }
-    targetProgram->setBindlessResourceIndexMap(map);
-
-    return SLANG_OK;
-}
-
-SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::setBindlessResolver(
-    Int targetIndex,
-    slang::SlangBindlessResolverCallback callback,
-    void* userData)
-{
-    auto linkage = getLinkage();
-    if (targetIndex < 0 || targetIndex >= linkage->targets.getCount())
-        return SLANG_E_INVALID_ARG;
-
-    auto target = linkage->targets[targetIndex];
-    auto targetProgram = getTargetProgram(target);
-
-    // BindlessResolverCallback is a typedef for SlangBindlessResolverCallback
-    targetProgram->setBindlessResolver(callback, userData, nullptr);
-
-    return SLANG_OK;
-}
-
-SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::setBindlessArrayResolver(
-    Int targetIndex,
-    slang::SlangBindlessArrayResolverCallback callback,
-    void* userData)
-{
-    auto linkage = getLinkage();
-    if (targetIndex < 0 || targetIndex >= linkage->targets.getCount())
-        return SLANG_E_INVALID_ARG;
-
-    auto target = linkage->targets[targetIndex];
-    auto targetProgram = getTargetProgram(target);
-    targetProgram->setBindlessArrayResolver(callback, userData);
-
-    return SLANG_OK;
-}
-
-SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::setBindlessCombinedSamplerResolver(
-    Int targetIndex,
-    slang::SlangBindlessCombinedSamplerResolverCallback callback,
-    void* userData)
-{
-    auto linkage = getLinkage();
-    if (targetIndex < 0 || targetIndex >= linkage->targets.getCount())
-        return SLANG_E_INVALID_ARG;
-
-    auto target = linkage->targets[targetIndex];
-    auto targetProgram = getTargetProgram(target);
-    targetProgram->setBindlessCombinedSamplerResolver(callback, userData);
-
-    return SLANG_OK;
-}
-
 SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::setFragmentOutputResolver(
     Int targetIndex,
     slang::SlangFragmentOutputResolverCallback callback,
@@ -656,6 +578,22 @@ SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::setFragmentOutputResolver(
     auto target = linkage->targets[targetIndex];
     auto targetProgram = getTargetProgram(target);
     targetProgram->setFragmentOutputResolver(callback, userData);
+
+    return SLANG_OK;
+}
+
+SLANG_NO_THROW SlangResult SLANG_MCALL ComponentType::setBindlessArraySizeResolver(
+    Int targetIndex,
+    slang::SlangBindlessArraySizeResolverCallback callback,
+    void* userData)
+{
+    auto linkage = getLinkage();
+    if (targetIndex < 0 || targetIndex >= linkage->targets.getCount())
+        return SLANG_E_INVALID_ARG;
+
+    auto target = linkage->targets[targetIndex];
+    auto targetProgram = getTargetProgram(target);
+    targetProgram->setBindlessArraySizeResolver(callback, userData);
 
     return SLANG_OK;
 }

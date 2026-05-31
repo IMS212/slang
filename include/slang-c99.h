@@ -102,62 +102,13 @@ typedef struct SlangcResourceInfo {
     const char* typeName;   /* Type name (e.g., "Texture2D", "SamplerState") */
     int set;                /* Descriptor set (-1 if not applicable). For bindless resources, this is the heap set. */
     int binding;            /* Binding number (-1 if not applicable). For bindless resources, this is the heap binding. */
-    int bindlessIndex;      /* Descriptor index within the bindless heap (-1 if not bindless) */
+    int bindlessIndex;      /* Base slot in the generated bindless index buffer (-1 if not bindless) */
+    int bindingCount;       /* Number of index-buffer slots required by this binding. -1 for unsized arrays. */
     SlangcResourceObjectType objectType;  /* Resource object type */
     int isArray;            /* Non-zero if this resource is an array */
     int arraySize;          /* -1 for unsized arrays, otherwise the total array element count. 0 if not an array. */
     SlangcResourceAccess access;  /* Access mode (read, write, or read-write) */
 } SlangcResourceInfo;
-
-/*
- * Bindless resource type (for resolver callback)
- * These correspond to different descriptor heap bindings.
- */
-typedef enum SlangcBindlessResourceType {
-    SLANGC_BINDLESS_SAMPLER = 0,
-    SLANGC_BINDLESS_COMBINED_TEXTURE_SAMPLER = 1,
-    SLANGC_BINDLESS_SAMPLED_IMAGE = 2,      /* Texture (read-only) */
-    SLANGC_BINDLESS_STORAGE_IMAGE = 3,      /* RWTexture (read-write) */
-    SLANGC_BINDLESS_UNIFORM_BUFFER = 4,     /* ConstantBuffer */
-    SLANGC_BINDLESS_STORAGE_BUFFER = 5,     /* StructuredBuffer, ByteAddressBuffer, etc. */
-} SlangcBindlessResourceType;
-
-/*
- * Bindless resolver callback.
- * Called during linking to resolve descriptor indices for resources.
- * Return the descriptor index for this resource, or -1 to skip (not bindless).
- */
-typedef int (*SlangcBindlessResolverCallback)(
-    const char* resourceName,
-    SlangcBindlessResourceType resourceType,
-    void* userData
-);
-
-/*
- * Bindless array resolver callback.
- * Called during linking to resolve base indices for arrayed resources.
- * `shaderArrayLength` is -1 for unsized arrays.
- * Implementations must write the resolved array length to `outResolvedArrayLength`.
- * Return the descriptor base index for this array, or -1 to skip (not bindless).
- */
-typedef int (*SlangcBindlessArrayResolverCallback)(
-    const char* resourceName,
-    SlangcBindlessResourceType resourceType,
-    int shaderArrayLength,
-    int* outResolvedArrayLength,
-    void* userData
-);
-
-/*
- * Bindless combined-sampler resolver callback.
- * Called during linking for combined texture-sampler resources (e.g. Sampler2D)
- * to choose the sampler descriptor index used after lowering to texture + sampler.
- * Return < 0 to use default sampler index 0.
- */
-typedef int (*SlangcBindlessCombinedSamplerResolverCallback)(
-    const char* resourceName,
-    void* userData
-);
 
 /*
  * Fragment output resolver callback.
@@ -166,6 +117,17 @@ typedef int (*SlangcBindlessCombinedSamplerResolverCallback)(
  */
 typedef int (*SlangcFragmentOutputResolverCallback)(
     const char* outputName,
+    void* userData
+);
+
+/*
+ * Bindless array size resolver callback.
+ * Called during automatic bindless lowering for unsized resource arrays.
+ * Return the runtime array length/index-buffer slot count, or <= 0 if unresolved.
+ */
+typedef int (*SlangcBindlessArraySizeResolverCallback)(
+    const char* resourceName,
+    SlangcResourceObjectType resourceType,
     void* userData
 );
 
@@ -275,44 +237,6 @@ SLANGC_API void slangc_addEntryPoint(
     SlangcStage stage
 );
 
-/* Set a bindless resource index mapping for this program (static) */
-SLANGC_API void slangc_setBindlessResourceIndex(
-    SlangcProgram program,
-    const char* resourceName,
-    int index
-);
-
-/*
- * Set a bindless resolver callback (dynamic alternative to static indices).
- * The callback is invoked during linking for each resource to get its index.
- * If both callback and static indices are set, callback takes precedence.
- */
-SLANGC_API void slangc_setBindlessResolver(
-SlangcCompiler compiler,
-    SlangcBindlessResolverCallback callback,
-    void* userData
-);
-
-/*
- * Set a bindless array resolver callback for arrayed resources (e.g. Texture2D[]).
- * The callback is invoked during linking for each used resource array.
- */
-SLANGC_API void slangc_setBindlessArrayResolver(
-    SlangcCompiler compiler,
-    SlangcBindlessArrayResolverCallback callback,
-    void* userData
-);
-
-/*
- * Set a bindless combined-sampler resolver callback.
- * This callback picks the sampler descriptor index used for bindless Sampler2D lowering.
- */
-SLANGC_API void slangc_setBindlessCombinedSamplerResolver(
-    SlangcCompiler compiler,
-    SlangcBindlessCombinedSamplerResolverCallback callback,
-    void* userData
-);
-
 /*
  * Set a fragment output resolver callback.
  * This callback resolves SPIR-V fragment color output names to Location decorations.
@@ -320,6 +244,16 @@ SLANGC_API void slangc_setBindlessCombinedSamplerResolver(
 SLANGC_API void slangc_setFragmentOutputResolver(
     SlangcCompiler compiler,
     SlangcFragmentOutputResolverCallback callback,
+    void* userData
+);
+
+/*
+ * Set a bindless array size resolver callback.
+ * This callback resolves unsized automatic bindless resource arrays to a slot count.
+ */
+SLANGC_API void slangc_setBindlessArraySizeResolver(
+    SlangcCompiler compiler,
+    SlangcBindlessArraySizeResolverCallback callback,
     void* userData
 );
 
@@ -372,11 +306,11 @@ SLANGC_API int slangc_getBindlessResourceCount(SlangcProgram program);
 /* Get bindless resource info by index. Returns 1 on success, 0 on failure. */
 SLANGC_API int slangc_getBindlessResource(SlangcProgram program, int index, SlangcResourceInfo* outInfo);
 
-/* Get number of resources that were NOT in the bindless map (warnings) */
-SLANGC_API int slangc_getUnmappedResourceCount(SlangcProgram program);
+/* Get number of resources converted to automatic bindless index-buffer access. */
+SLANGC_API int slangc_getUsedBindingCount(SlangcProgram program);
 
-/* Get unmapped resource info by index. Returns 1 on success, 0 on failure. */
-SLANGC_API int slangc_getUnmappedResource(SlangcProgram program, int index, SlangcResourceInfo* outInfo);
+/* Get automatic bindless binding info by index. Returns 1 on success, 0 on failure. */
+SLANGC_API int slangc_getUsedBinding(SlangcProgram program, int index, SlangcResourceInfo* outInfo);
 
 /*
  * Reflection - Entry Points

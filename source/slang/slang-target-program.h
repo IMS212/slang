@@ -123,49 +123,6 @@ public:
         return isSPIRV(m_targetReq->getTarget()) && getOptionSet().shouldEmitSPIRVDirectly();
     }
 
-    /// Set the resource name to bindless index mapping.
-    /// Resources matching names in this map will be converted to
-    /// DescriptorHandle lookups with direct descriptor heap indices.
-    void setBindlessResourceIndexMap(const Dictionary<String, int>& map)
-    {
-        m_bindlessResourceIndexMap = map;
-    }
-
-    /// Get the bindless resource index map.
-    Dictionary<String, int>& getBindlessResourceIndexMap() { return m_bindlessResourceIndexMap; }
-
-    /// Set the bindless resolver callback for dynamic index resolution.
-    /// The callback is invoked during IR lowering (after DCE) for each used resource.
-    void setBindlessResolver(
-        BindlessResolverCallback callback,
-        void* userData,
-        Dictionary<String, int>* cache)
-    {
-        m_bindlessResolver = callback;
-        m_bindlessResolverUserData = userData;
-        m_bindlessResolverCache = cache;
-    }
-
-    /// Set the bindless array resolver callback for dynamic base-index resolution.
-    /// The callback is invoked during IR lowering (after DCE) for each used resource array.
-    void setBindlessArrayResolver(
-        BindlessArrayResolverCallback callback,
-        void* userData)
-    {
-        m_bindlessArrayResolver = callback;
-        m_bindlessArrayResolverUserData = userData;
-    }
-
-    /// Set the callback for selecting fixed sampler indices when lowering
-    /// combined texture-sampler resources to texture + sampler pairs.
-    void setBindlessCombinedSamplerResolver(
-        BindlessCombinedSamplerResolverCallback callback,
-        void* userData)
-    {
-        m_bindlessCombinedSamplerResolver = callback;
-        m_bindlessCombinedSamplerResolverUserData = userData;
-    }
-
     void setFragmentOutputResolver(
         slang::SlangFragmentOutputResolverCallback callback,
         void* userData)
@@ -174,31 +131,32 @@ public:
         m_fragmentOutputResolverUserData = userData;
     }
 
-    /// Map of resource names to bindless indices for conversion.
-    /// This is public so IR passes can access it directly.
-    Dictionary<String, int> m_bindlessResourceIndexMap;
+    void setBindlessArraySizeResolver(
+        slang::SlangBindlessArraySizeResolverCallback callback,
+        void* userData)
+    {
+        m_bindlessArraySizeResolver = callback;
+        m_bindlessArraySizeResolverUserData = userData;
+    }
 
-    /// Bindless resolver callback for dynamic index resolution.
-    /// Called during IR lowering for each resource that needs a bindless index.
-    BindlessResolverCallback m_bindlessResolver = nullptr;
-    void* m_bindlessResolverUserData = nullptr;
+    bool hasBindlessArraySizeResolver() const { return m_bindlessArraySizeResolver != nullptr; }
 
-    /// Pointer to external cache (owned by caller, e.g., C99 compiler).
-    /// Key format is "resourceName:resourceType" where resourceType is the enum value.
-    Dictionary<String, int>* m_bindlessResolverCache = nullptr;
-
-    /// Bindless array resolver callback for dynamic array base-index resolution.
-    /// Called during IR lowering for each resource array that needs a bindless base index.
-    BindlessArrayResolverCallback m_bindlessArrayResolver = nullptr;
-    void* m_bindlessArrayResolverUserData = nullptr;
-
-    /// Callback for selecting sampler descriptor indices when lowering combined
-    /// texture-sampler resources to texture + sampler pairs.
-    BindlessCombinedSamplerResolverCallback m_bindlessCombinedSamplerResolver = nullptr;
-    void* m_bindlessCombinedSamplerResolverUserData = nullptr;
+    int resolveBindlessArraySize(
+        const char* resourceName,
+        slang::SlangBindlessResourceType resourceType)
+    {
+        if (!m_bindlessArraySizeResolver)
+            return -1;
+        return m_bindlessArraySizeResolver(
+            resourceName,
+            resourceType,
+            m_bindlessArraySizeResolverUserData);
+    }
 
     slang::SlangFragmentOutputResolverCallback m_fragmentOutputResolver = nullptr;
     void* m_fragmentOutputResolverUserData = nullptr;
+    slang::SlangBindlessArraySizeResolverCallback m_bindlessArraySizeResolver = nullptr;
+    void* m_bindlessArraySizeResolverUserData = nullptr;
 
 private:
     RefPtr<IRModule> createIRModuleForLayout(DiagnosticSink* sink);

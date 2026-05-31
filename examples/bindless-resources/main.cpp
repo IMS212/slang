@@ -15,9 +15,6 @@
 #include "slang-com-ptr.h"
 #include "slang-com-helper.h"
 
-// Internal header for IArtifactPostEmitMetadata (provides getBindlessConvertedResources)
-#include "../../source/compiler-core/slang-artifact-associated.h"
-
 using Slang::ComPtr;
 
 // Helper to print diagnostics
@@ -88,50 +85,6 @@ int main(int argc, char** argv)
     }
 
     // =========================================================================
-    // BINDLESS RESOURCE CONFIGURATION
-    // =========================================================================
-    // Query for IComponentType3 interface which provides bindless resource support
-    ComPtr<slang::IComponentType3> comp3;
-    if (SLANG_FAILED(composedProgram->queryInterface(
-            slang::IComponentType3::getTypeGuid(),
-            (void**)comp3.writeRef())))
-    {
-        printf("IComponentType3 interface not available\n");
-        return 1;
-    }
-
-    // Define the mapping from resource names to bindless index buffer indices.
-    // In a real application, these indices would correspond to positions in your
-    // bindless descriptor heap.
-    // Note: For struct members, use the original field name (e.g., "diffuse").
-    // It will match the hoisted name (e.g., "materialTextures_diffuse") via suffix matching.
-    const char* resourceNames[] = {
-        "diffuse",          // Index 0 - matches MaterialTextures.diffuse
-        "normal",           // Index 1 - matches MaterialTextures.normal
-        "textureSampler",   // Index 2 in bindless heap
-    };
-    SlangInt resourceIndices[] = { 0, 1, 2 };
-
-    // Set the bindless resource index map for target 0 (SPIRV)
-    if (SLANG_FAILED(comp3->setBindlessResourceIndexMap(
-            0,  // targetIndex
-            resourceNames,
-            resourceIndices,
-            3   // count
-        )))
-    {
-        printf("Failed to set bindless resource index map\n");
-        return 1;
-    }
-
-    printf("Bindless resource index map configured:\n");
-    for (int i = 0; i < 3; i++)
-    {
-        printf("  %s -> index %lld\n", resourceNames[i], (long long)resourceIndices[i]);
-    }
-    printf("\n");
-
-    // =========================================================================
     // COMPILE AND GET RESULTS
     // =========================================================================
     // Link the program - this triggers the bindless lowering pass
@@ -161,32 +114,34 @@ int main(int argc, char** argv)
     ComPtr<slang::IMetadata> metadata;
     if (SLANG_SUCCEEDED(linkedProgram->getTargetMetadata(0, metadata.writeRef(), nullptr)))
     {
-        // Query for the extended metadata interface
-        ComPtr<Slang::IArtifactPostEmitMetadata> postEmitMetadata;
+        ComPtr<slang::IBindlessResourceUsageMetadata> bindlessMetadata;
         if (SLANG_SUCCEEDED(metadata->queryInterface(
-                Slang::IArtifactPostEmitMetadata::getTypeGuid(),
-                (void**)postEmitMetadata.writeRef())))
+                slang::IBindlessResourceUsageMetadata::getTypeGuid(),
+                (void**)bindlessMetadata.writeRef())))
         {
-            // Get the list of resources that were converted to bindless
-            auto convertedResources = postEmitMetadata->getBindlessConvertedResources();
-
-            printf("Converted resources (%d total):\n", (int)convertedResources.count);
-            for (Slang::Index i = 0; i < convertedResources.count; i++)
+            auto resourceCount = bindlessMetadata->getBindlessResourceUsageCount();
+            printf("Converted resources (%u total):\n", (unsigned)resourceCount);
+            for (SlangUInt i = 0; i < resourceCount; i++)
             {
-                const auto& info = convertedResources[i];
-                printf("  [%d] %s (%s) -> bindless index %lld\n",
-                    (int)i,
-                    info.name.begin(),
-                    info.typeName.begin(),
-                    (long long)info.index);
+                slang::BindlessResourceUsageInfo info;
+                if (SLANG_FAILED(bindlessMetadata->getBindlessResourceUsage(i, &info)))
+                    continue;
+                printf("  [%u] %s (%s) heap=set%lld,binding%lld -> indexBuffer[%lld] count %lld\n",
+                    (unsigned)i,
+                    info.name,
+                    info.typeName,
+                    (long long)info.set,
+                    (long long)info.binding,
+                    (long long)info.index,
+                    (long long)info.bindingCount);
             }
             printf("\n");
         }
 
         printf("The generated SPIRV will:\n");
-        printf("  1. Declare descriptor arrays at set 2 (samplers at binding 0, textures at binding 2)\n");
-        printf("  2. Declare a StructuredBuffer<uint2> at set 1, binding 3 for indices\n");
-        printf("  3. Load indices from the buffer and use them to access descriptor arrays\n");
+        printf("  1. Declare descriptor arrays at set 0 (samplers at binding 0, textures at binding 2)\n");
+        printf("  2. Declare ConstantBuffer<uint[4000]> at set 2, binding 0 for descriptor indices\n");
+        printf("  3. Load descriptor indices from indexBuffer slots before accessing descriptor arrays\n");
     }
 
     printf("\nExample completed successfully!\n");

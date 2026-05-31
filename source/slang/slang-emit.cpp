@@ -1692,12 +1692,10 @@ Result linkAndOptimizeIR(
     else
         SLANG_PASS(simplifyIR, targetProgram, fastIRSimplificationOptions, sink);
 
-    // Lower global resources to bindless descriptor handles if configured.
+    // Lower global resources to automatic bindless descriptor handles.
     // This runs after legalizeResourceTypes (so struct members are hoisted)
     // and after DCE (so only actually-used resources are converted).
-    if (targetProgram->m_bindlessResourceIndexMap.getCount() > 0 ||
-        targetProgram->m_bindlessResolver ||
-        targetProgram->m_bindlessArrayResolver)
+    if (isSPIRV(targetProgram->getTargetReq()->getTarget()))
     {
         SLANG_PASS(lowerBindlessResources, targetProgram, sink, &bindlessConvertedResources);
         // Bindless lowering creates GetDynamicResourceHeap instructions that need lowering
@@ -2399,8 +2397,9 @@ Result linkAndOptimizeIR(
         info.name = metadata->m_bindlessAllocator.allocate(res.name.getUnownedSlice());
         info.typeName = metadata->m_bindlessAllocator.allocate(res.typeName.getUnownedSlice());
         info.set = bindlessSpaceIndex;
-        info.binding = SlangInt(static_cast<int>(res.resourceType));
+        info.binding = res.binding;
         info.index = res.index;
+        info.bindingCount = res.bindingCount;
         info.resourceType = static_cast<slang::SlangBindlessResourceType>(res.resourceType);
         info.isArray = res.isArray ? 1 : 0;
         info.arraySize = res.arraySize;

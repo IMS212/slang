@@ -15,6 +15,10 @@
 namespace Slang
 {
 
+static const int kBindlessIndexBufferSet = 2;
+static const int kBindlessIndexBufferBinding = 0;
+static const int kBindlessIndexBufferElementCount = 200;
+
 struct BindlessResourceLoweringContext
 {
     IRModule* module;
@@ -34,12 +38,20 @@ struct BindlessResourceLoweringContext
         IRArrayTypeBase* unsizedArrayType;
     };
     Dictionary<IRType*, LoweredStructuredBufferTypeInfo> loweredStructuredBufferTypes;
+    IRGlobalParam* indexBuffer = nullptr;
+    IRArrayTypeBase* indexBufferArrayType = nullptr;
+    IRStructKey* indexBufferArrayKey = nullptr;
+    IRType* indexBufferDataLayoutType = nullptr;
+    int nextIndexBufferSlot = 0;
 
     struct ResourceToConvert
     {
         IRGlobalParam* param = nullptr;
         IRType* resourceType = nullptr;
         int index = -1;
+        int bindingCount = 1;
+        int samplerIndex = -1;
+        int samplerBindingCount = 0;
         bool isArrayResource = false;
     };
 
@@ -382,6 +394,19 @@ struct BindlessResourceLoweringContext
         return varLayoutBuilder.build();
     }
 
+    IRVarLayout* createIndexBufferLayout(IRBuilder& builder)
+    {
+        IRTypeLayout::Builder typeLayoutBuilder(&builder);
+        typeLayoutBuilder.addResourceUsage(LayoutResourceKind::ConstantBuffer, 1);
+        auto typeLayout = typeLayoutBuilder.build();
+        IRVarLayout::Builder varLayoutBuilder(&builder, typeLayout);
+        varLayoutBuilder.findOrAddResourceInfo(LayoutResourceKind::RegisterSpace)->offset =
+            kBindlessIndexBufferSet;
+        varLayoutBuilder.findOrAddResourceInfo(LayoutResourceKind::ConstantBuffer)->offset =
+            kBindlessIndexBufferBinding;
+        return varLayoutBuilder.build();
+    }
+
     AddressSpace getResourceHeapAddressSpace(IRType* elementType)
     {
         switch (elementType->getOp())
@@ -487,6 +512,158 @@ struct BindlessResourceLoweringContext
 
         resourceHeaps[key] = resourceHeap;
         return resourceHeap;
+    }
+
+    IRGlobalParam* getOrCreateIndexBuffer()
+    {
+        if (indexBuffer)
+            return indexBuffer;
+
+        IRBuilder moduleBuilder(module);
+        moduleBuilder.setInsertInto(module->getModuleInst());
+
+        auto uintType = moduleBuilder.getUIntType();
+        auto intType = moduleBuilder.getIntType();
+        auto elementCount = moduleBuilder.getIntValue(intType, kBindlessIndexBufferElementCount);
+        auto elementStride = moduleBuilder.getIntValue(intType, 4);
+        indexBufferArrayType = moduleBuilder.getArrayTypeBase(
+            kIROp_ArrayType,
+            uintType,
+            elementCount,
+            elementStride);
+
+        indexBufferDataLayoutType = moduleBuilder.getScalarBufferLayoutType();
+
+        auto indexBufferStructType = moduleBuilder.createStructType();
+        indexBufferArrayKey = moduleBuilder.createStructKey();
+        moduleBuilder.createStructField(
+            indexBufferStructType,
+            indexBufferArrayKey,
+            indexBufferArrayType);
+        moduleBuilder.addNameHintDecoration(
+            indexBufferStructType,
+            toSlice("__slang_bindless_index_buffer_t"));
+
+        auto constantBufferType =
+            moduleBuilder.getConstantBufferType(indexBufferStructType, indexBufferDataLayoutType);
+        auto layoutRules = getTypeLayoutRuleForBuffer(targetProgram, constantBufferType);
+        IRSizeAndAlignment indexBufferSize;
+        getSizeAndAlignment(
+            targetProgram->getTargetReq(),
+            layoutRules,
+            indexBufferStructType,
+            &indexBufferSize);
+        moduleBuilder.addDecorationIfNotExist(indexBufferStructType, kIROp_SPIRVBlockDecoration);
+
+        indexBuffer = moduleBuilder.createGlobalParam(constantBufferType);
+        auto varLayout = createIndexBufferLayout(moduleBuilder);
+        moduleBuilder.addLayoutDecoration(indexBuffer, varLayout);
+        moduleBuilder.addNameHintDecoration(indexBuffer, toSlice("__slang_bindless_index_buffer"));
+        return indexBuffer;
+    }
+
+    int allocateIndexBufferSlots(int bindingCount)
+    {
+        int slot = nextIndexBufferSlot;
+        int slotsToReserve = bindingCount > 0 ? bindingCount : 1;
+        nextIndexBufferSlot += slotsToReserve;
+        return slot;
+    }
+
+    bool canAllocateIndexBufferSlots(const String& name, int bindingCount)
+    {
+        int slotsToReserve = bindingCount > 0 ? bindingCount : 1;
+        if (nextIndexBufferSlot + slotsToReserve <= kBindlessIndexBufferElementCount)
+            return true;
+
+        if (sink)
+        {
+            StringBuilder sb;
+            sb << "automatic bindless index buffer needs "
+               << nextIndexBufferSlot + slotsToReserve
+               << " slots after adding '" << name
+               << "', but the generated index buffer only has "
+               << kBindlessIndexBufferElementCount << " slots.";
+            sink->diagnoseRaw(Severity::Warning, sb.getUnownedSlice());
+        }
+        return false;
+    }
+
+    bool resolveArrayBindingCount(
+        const String& name,
+        BindlessResourceType resourceType,
+        int& bindingCount)
+    {
+        if (bindingCount >= 0)
+            return true;
+
+        if (!targetProgram || !targetProgram->hasBindlessArraySizeResolver())
+        {
+            if (sink)
+            {
+                StringBuilder sb;
+                sb << "automatic bindless resource array '" << name
+                   << "' has unknown size, but no bindless array size resolver was provided.";
+                sink->diagnoseRaw(Severity::Warning, sb.getUnownedSlice());
+            }
+            return false;
+        }
+
+        int resolvedBindingCount = targetProgram->resolveBindlessArraySize(
+            name.getBuffer(),
+            static_cast<slang::SlangBindlessResourceType>(resourceType));
+        if (resolvedBindingCount <= 0)
+        {
+            if (sink)
+            {
+                StringBuilder sb;
+                sb << "bindless array size resolver returned " << resolvedBindingCount
+                   << " for '" << name << "'; expected a positive slot count.";
+                sink->diagnoseRaw(Severity::Warning, sb.getUnownedSlice());
+            }
+            return false;
+        }
+
+        bindingCount = resolvedBindingCount;
+        return true;
+    }
+
+    IRInst* buildIndexBufferSlot(IRBuilder& builder, int baseIndex, IRInst* userIndex)
+    {
+        IRType* indexType = userIndex->getDataType();
+        auto basicType = as<IRBasicType>(indexType);
+        if (!basicType ||
+            (basicType->getBaseType() != BaseType::Int && basicType->getBaseType() != BaseType::UInt))
+        {
+            indexType = builder.getBasicType(BaseType::Int);
+            userIndex = builder.emitCast(indexType, userIndex);
+        }
+
+        auto baseLiteral = builder.getIntValue(indexType, baseIndex);
+        return builder.emitAdd(indexType, baseLiteral, userIndex);
+    }
+
+    IRInst* emitDescriptorIndexLoad(IRBuilder& builder, IRInst* indexBufferSlot)
+    {
+        auto indexBufferParam = getOrCreateIndexBuffer();
+        SLANG_ASSERT(indexBufferArrayKey);
+        auto arrayPtr = builder.emitFieldAddress(
+            builder.getPtrType(
+                indexBufferArrayType,
+                AccessQualifier::Read,
+                AddressSpace::Uniform,
+                indexBufferDataLayoutType),
+            indexBufferParam,
+            indexBufferArrayKey);
+        auto elementPtr = builder.emitElementAddress(
+            builder.getPtrType(
+                builder.getUIntType(),
+                AccessQualifier::Read,
+                AddressSpace::Uniform,
+                indexBufferDataLayoutType),
+            arrayPtr,
+            indexBufferSlot);
+        return builder.emitLoad(builder.getUIntType(), elementPtr);
     }
 
     // Create or get a wrapper struct type for StructuredBuffer<T>
@@ -708,49 +885,7 @@ struct BindlessResourceLoweringContext
         return false;
     }
 
-    // Try to find a scalar resource name in the index map.
-    // First tries exact match, then tries suffix match for hoisted struct members.
-    int findIndexForName(const String& name, const Dictionary<String, int>& indexMap)
-    {
-        if (auto* index = indexMap.tryGetValue(name))
-            return *index;
-
-        for (const auto& [key, value] : indexMap)
-        {
-            if (key.endsWith("[]"))
-                continue;
-
-            String suffix = "." + key;
-            if (name.endsWith(suffix))
-                return value;
-        }
-
-        return -1;
-    }
-
-    // Try to find an array resource name in the index map.
-    // Array keys are represented as "name[]".
-    int findArrayIndexForName(const String& name, const Dictionary<String, int>& indexMap)
-    {
-        String arrayName = name + "[]";
-        if (auto* index = indexMap.tryGetValue(arrayName))
-            return *index;
-
-        for (const auto& [key, value] : indexMap)
-        {
-            if (!key.endsWith("[]"))
-                continue;
-
-            String baseKey = key.subString(0, key.getLength() - 2);
-            String suffix = "." + baseKey;
-            if (name.endsWith(suffix))
-                return value;
-        }
-
-        return -1;
-    }
-
-    // Map IR type to BindlessResourceType enum for resolver callbacks.
+    // Map IR type to BindlessResourceType enum for usage metadata.
     BindlessResourceType getBindlessResourceTypeForIRType(IRType* type)
     {
         type = unwrapArrayType(type);
@@ -821,14 +956,6 @@ struct BindlessResourceLoweringContext
         }
     }
 
-    // Make a cache key from resource name and type
-    String makeCacheKey(const String& name, BindlessResourceType resourceType)
-    {
-        StringBuilder sb;
-        sb << name << ":" << (int)resourceType;
-        return sb.produceString();
-    }
-
     // Get the binding index for a resource type (VkMutable bindings)
     int getBindingIndexForResourceType(IRType* type)
     {
@@ -868,97 +995,10 @@ struct BindlessResourceLoweringContext
         }
     }
 
-    int resolveBindlessIndex(const String& name, IRType* resourceType)
-    {
-        auto& indexMap = targetProgram->m_bindlessResourceIndexMap;
-        auto resolver = targetProgram->m_bindlessResolver;
-        auto cache = targetProgram->m_bindlessResolverCache;
-        auto userData = targetProgram->m_bindlessResolverUserData;
-
-        int staticIndex = findIndexForName(name, indexMap);
-        if (staticIndex >= 0)
-            return staticIndex;
-
-        if (!resolver)
-            return -1;
-
-        BindlessResourceType bindlessType = getBindlessResourceTypeForIRType(resourceType);
-        String cacheKey = makeCacheKey(name, bindlessType);
-        if (cache)
-        {
-            if (auto* cachedIndex = cache->tryGetValue(cacheKey))
-                return *cachedIndex;
-        }
-
-        slang::SlangBindlessResourceType publicType =
-            static_cast<slang::SlangBindlessResourceType>(bindlessType);
-        int resolvedIndex = resolver(name.getBuffer(), publicType, userData);
-        if (cache && resolvedIndex >= 0)
-            cache->add(cacheKey, resolvedIndex);
-        return resolvedIndex;
-    }
-
-    bool hasScalarBindingForArrayName(const String& name, IRType* resourceType)
-    {
-        return resolveBindlessIndex(name, resourceType) >= 0;
-    }
-
-    int resolveBindlessArrayBaseIndex(
-        const String& name,
-        IRType* resourceType,
-        int shaderArrayLength,
-        int* outResolvedArrayLength)
-    {
-        if (outResolvedArrayLength)
-            *outResolvedArrayLength = -1;
-
-        auto& indexMap = targetProgram->m_bindlessResourceIndexMap;
-        int staticIndex = findArrayIndexForName(name, indexMap);
-        if (staticIndex >= 0)
-        {
-            if (outResolvedArrayLength)
-                *outResolvedArrayLength = shaderArrayLength;
-            return staticIndex;
-        }
-
-        auto resolver = targetProgram->m_bindlessArrayResolver;
-        auto userData = targetProgram->m_bindlessArrayResolverUserData;
-        if (!resolver)
-            return -1;
-
-        BindlessResourceType bindlessType = getBindlessResourceTypeForIRType(resourceType);
-        slang::SlangBindlessResourceType publicType =
-            static_cast<slang::SlangBindlessResourceType>(bindlessType);
-        int resolvedArrayLength = -1;
-        int baseIndex =
-            resolver(name.getBuffer(), publicType, shaderArrayLength, &resolvedArrayLength, userData);
-        if (outResolvedArrayLength)
-            *outResolvedArrayLength = resolvedArrayLength;
-        return baseIndex;
-    }
-
-    int resolveCombinedSamplerIndex(const String& name)
-    {
-        auto resolver = targetProgram->m_bindlessCombinedSamplerResolver;
-        auto userData = targetProgram->m_bindlessCombinedSamplerResolverUserData;
-        if (!resolver)
-            return 0;
-
-        int resolvedIndex = resolver(name.getBuffer(), userData);
-        return resolvedIndex >= 0 ? resolvedIndex : 0;
-    }
-
     void processModule()
     {
-        auto& indexMap = targetProgram->m_bindlessResourceIndexMap;
-        auto resolver = targetProgram->m_bindlessResolver;
-        auto arrayResolver = targetProgram->m_bindlessArrayResolver;
-        if (indexMap.getCount() == 0 && !resolver && !arrayResolver)
-            return;
-
         List<ResourceToConvert> resourcesToConvert;
-        List<IRGlobalParam*> unmappedResources;
-        List<IRGlobalParam*> arrayResourcesWithScalarConflict;
+        List<IRGlobalParam*> unconvertedResources;
 
         for (auto inst : module->getGlobalInsts())
         {
@@ -984,14 +1024,23 @@ struct BindlessResourceLoweringContext
             int shaderArrayLength = -1;
             if (getDirectArrayResourceInfo(paramType, &arrayElementType, &shaderArrayLength))
             {
-                int resolvedArrayLength = -1;
-                int baseIndex = resolveBindlessArrayBaseIndex(
-                    name,
-                    arrayElementType,
-                    shaderArrayLength,
-                    &resolvedArrayLength);
-
-                if (baseIndex >= 0)
+                int bindingCount = shaderArrayLength >= 0 ? shaderArrayLength : -1;
+                auto resolverResourceType = isCombinedTextureType(arrayElementType)
+                                                ? BindlessResourceType::CombinedTextureSampler
+                                                : getBindlessResourceTypeForIRType(arrayElementType);
+                if (!resolveArrayBindingCount(
+                        name,
+                        resolverResourceType,
+                        bindingCount))
+                {
+                    unconvertedResources.add(globalParam);
+                    continue;
+                }
+                int slotsToReserve = bindingCount >= 0 ? bindingCount : 1;
+                int totalSlotsToReserve = slotsToReserve;
+                if (isCombinedTextureType(arrayElementType))
+                    totalSlotsToReserve += slotsToReserve;
+                if (canAllocateIndexBufferSlots(name, totalSlotsToReserve))
                 {
                     if (isCombinedTextureType(arrayElementType) &&
                         isSPIRV(targetProgram->getTargetReq()->getTarget()))
@@ -1005,50 +1054,32 @@ struct BindlessResourceLoweringContext
                         continue;
                     }
 
-                    if (shaderArrayLength >= 0 &&
-                        resolvedArrayLength >= 0 &&
-                        shaderArrayLength != resolvedArrayLength)
-                    {
-                        if (sink)
-                        {
-                            StringBuilder sb;
-                            sb << "bindless array resolver returned length "
-                               << resolvedArrayLength
-                               << " for '" << name
-                               << "', but shader declares length "
-                               << shaderArrayLength << ".";
-                            sink->diagnoseRaw(Severity::Warning, sb.getUnownedSlice());
-                        }
-                        continue;
-                    }
-
                     ResourceToConvert info;
                     info.param = globalParam;
                     info.resourceType = arrayElementType;
-                    info.index = baseIndex;
+                    info.index = allocateIndexBufferSlots(slotsToReserve);
+                    info.bindingCount = bindingCount;
                     info.isArrayResource = true;
+                    if (isCombinedTextureType(arrayElementType))
+                    {
+                        info.samplerIndex = allocateIndexBufferSlots(slotsToReserve);
+                        info.samplerBindingCount = bindingCount;
+                    }
                     resourcesToConvert.add(info);
                 }
-                else
-                {
-                    if (hasScalarBindingForArrayName(name, arrayElementType))
-                        arrayResourcesWithScalarConflict.add(globalParam);
-                    else
-                        unmappedResources.add(globalParam);
-                }
                 continue;
             }
 
-            // Only direct arrays of resource objects are lowered through the array resolver path.
-            // More complex array nesting is currently left unmapped.
+            // Only direct arrays of resource objects are lowered automatically.
+            // More complex array nesting is currently left unchanged.
             if (as<IRArrayTypeBase>(paramType))
             {
-                unmappedResources.add(globalParam);
+                unconvertedResources.add(globalParam);
                 continue;
             }
 
-            int index = resolveBindlessIndex(name, paramType);
-            if (index >= 0)
+            int totalSlotsToReserve = isCombinedTextureType(paramType) ? 2 : 1;
+            if (canAllocateIndexBufferSlots(name, totalSlotsToReserve))
             {
                 if (isCombinedTextureType(paramType) &&
                     isSPIRV(targetProgram->getTargetReq()->getTarget()))
@@ -1065,36 +1096,26 @@ struct BindlessResourceLoweringContext
                 ResourceToConvert info;
                 info.param = globalParam;
                 info.resourceType = paramType;
-                info.index = index;
+                info.index = allocateIndexBufferSlots(1);
+                info.bindingCount = 1;
                 info.isArrayResource = false;
+                if (isCombinedTextureType(paramType))
+                {
+                    info.samplerIndex = allocateIndexBufferSlots(1);
+                    info.samplerBindingCount = 1;
+                }
                 resourcesToConvert.add(info);
-            }
-            else
-            {
-                unmappedResources.add(globalParam);
             }
         }
 
-        for (auto param : unmappedResources)
+        for (auto param : unconvertedResources)
         {
             auto nameHint = param->findDecoration<IRNameHintDecoration>();
             if (nameHint && sink)
             {
                 StringBuilder sb;
                 sb << "resource '" << nameHint->getName()
-                   << "' is not in bindless map and no resolver produced an index.";
-                sink->diagnoseRaw(Severity::Warning, sb.getUnownedSlice());
-            }
-        }
-
-        for (auto param : arrayResourcesWithScalarConflict)
-        {
-            auto nameHint = param->findDecoration<IRNameHintDecoration>();
-            if (nameHint && sink)
-            {
-                StringBuilder sb;
-                sb << "array resource '" << nameHint->getName()
-                   << "' conflicts with a scalar bindless binding of the same name.";
+                   << "' could not be converted to automatic bindless access.";
                 sink->diagnoseRaw(Severity::Warning, sb.getUnownedSlice());
             }
         }
@@ -1105,9 +1126,21 @@ struct BindlessResourceLoweringContext
         for (const auto& resource : resourcesToConvert)
         {
             if (resource.isArrayResource)
-                convertArrayResourceWithResolver(resource.param, resource.resourceType, resource.index);
+                convertArrayResourceWithIndexSlot(
+                    resource.param,
+                    resource.resourceType,
+                    resource.index,
+                    resource.bindingCount,
+                    resource.samplerIndex,
+                    resource.samplerBindingCount);
             else
-                convertResourceWithResolver(resource.param, resource.resourceType, resource.index);
+                convertResourceWithIndexSlot(
+                    resource.param,
+                    resource.resourceType,
+                    resource.index,
+                    resource.bindingCount,
+                    resource.samplerIndex,
+                    resource.samplerBindingCount);
         }
     }
 
@@ -1134,25 +1167,10 @@ struct BindlessResourceLoweringContext
         }
     }
 
-    IRInst* buildArrayedDescriptorIndex(IRBuilder& builder, int baseIndex, IRInst* userIndex)
-    {
-
-        IRType* indexType = userIndex->getDataType();
-        auto basicType = as<IRBasicType>(indexType);
-        if (!basicType || (basicType->getBaseType() != BaseType::Int && basicType->getBaseType() != BaseType::UInt))
-        {
-            indexType = builder.getBasicType(BaseType::Int);
-            userIndex = builder.emitCast(indexType, userIndex);
-        }
-
-        auto baseLiteral = builder.getIntValue(indexType, baseIndex);
-        return builder.emitAdd(indexType, baseLiteral, userIndex);
-    }
-
     IRInst* emitBindlessTextureLookup(
         IRBuilder& builder,
         IRType* resourceType,
-        IRInst* heapIndex,
+        IRInst* indexBufferSlot,
         bool nonUniformHeapIndex)
     {
         auto bindlessLookupType = getUncombinedTextureType(builder, resourceType);
@@ -1161,8 +1179,9 @@ struct BindlessResourceLoweringContext
             isSPIRV(targetProgram->getTargetReq()->getTarget());
 
         if (nonUniformHeapIndex && !useSPIRVNonUniformDecoration)
-            heapIndex = builder.emitNonUniformResourceIndexInst(heapIndex);
+            indexBufferSlot = builder.emitNonUniformResourceIndexInst(indexBufferSlot);
 
+        auto heapIndex = emitDescriptorIndexLoad(builder, indexBufferSlot);
         auto resourceHeap = getOrCreateResourceHeap(bindingIndex, bindlessLookupType);
         auto elementPtr = builder.emitElementAddress(resourceHeap, heapIndex);
         if (nonUniformHeapIndex && useSPIRVNonUniformDecoration)
@@ -1178,7 +1197,7 @@ struct BindlessResourceLoweringContext
         const String& resourceName,
         IRType* resourceType,
         IRUse* use,
-        IRInst* heapIndex,
+        IRInst* indexBufferSlot,
         bool nonUniformHeapIndex = false)
     {
         SLANG_UNUSED(resourceName);
@@ -1214,7 +1233,7 @@ struct BindlessResourceLoweringContext
             builder.setInsertBefore(operandUser);
 
             auto replacementValue =
-                emitBindlessTextureLookup(builder, resourceType, heapIndex, nonUniformHeapIndex);
+                emitBindlessTextureLookup(builder, resourceType, indexBufferSlot, nonUniformHeapIndex);
 
             IRSPIRVAsmOperand* replacementOperand = nullptr;
             switch (asmOperand->getOp())
@@ -1243,9 +1262,11 @@ struct BindlessResourceLoweringContext
         const String& resourceName,
         IRType* resourceType,
         IRUse* use,
-        IRInst* heapIndex,
+        IRInst* indexBufferSlot,
+        IRInst* samplerIndexBufferSlot = nullptr,
         bool nonUniformHeapIndex = false)
     {
+        SLANG_UNUSED(resourceName);
         auto user = use->getUser();
         auto combinedTextureType = as<IRTextureType>(resourceType);
         bool isCombinedTextureResource = combinedTextureType && combinedTextureType->isCombined();
@@ -1290,17 +1311,26 @@ struct BindlessResourceLoweringContext
 
         IRInst* resourceHeap =
             getOrCreateResourceHeap(bindingIndex, heapElementType, heapDataLayoutType);
+        IRInst* heapIndex = emitDescriptorIndexLoad(builder, indexBufferSlot);
 
         if (isCombinedTextureResource)
         {
             auto samplerType = getIntVal(combinedTextureType->getIsShadowInst()) != 0
                                    ? builder.getType(kIROp_SamplerComparisonStateType)
                                    : builder.getType(kIROp_SamplerStateType);
-            int fixedSamplerIndex = resolveCombinedSamplerIndex(resourceName);
             auto target = targetProgram->getTargetReq()->getTarget();
             bool useSamplerHeapIntrinsic = !(
                 target == CodeGenTarget::SPIRV || target == CodeGenTarget::SPIRVAssembly ||
                 target == CodeGenTarget::GLSL);
+            IRInst* samplerIndex = nullptr;
+            if (samplerIndexBufferSlot)
+            {
+                samplerIndex = emitDescriptorIndexLoad(builder, samplerIndexBufferSlot);
+            }
+            else
+            {
+                samplerIndex = builder.getIntValue(builder.getUIntType(), 0);
+            }
 
             switch (user->getOp())
             {
@@ -1321,7 +1351,8 @@ struct BindlessResourceLoweringContext
                     if (nonUniformHeapIndex && !useSPIRVNonUniformDecoration)
                         textureIndex = builder.emitNonUniformResourceIndexInst(textureIndex);
 
-                    auto samplerIndex = builder.getIntValue(uintType, fixedSamplerIndex);
+                    if (samplerIndex->getDataType() != uintType)
+                        samplerIndex = builder.emitCast(uintType, samplerIndex);
                     auto uint2Type = builder.getVectorType(uintType, 2);
                     IRInst* handleComps[2] = {textureIndex, samplerIndex};
                     auto packedHandle = builder.emitMakeVector(uint2Type, 2, handleComps);
@@ -1354,8 +1385,6 @@ struct BindlessResourceLoweringContext
             if (nonUniformHeapIndex && useSPIRVNonUniformDecoration)
                 builder.addSPIRVNonUniformResourceDecoration(textureVal);
 
-            auto samplerIndexLiteral =
-                builder.getIntValue(builder.getBasicType(BaseType::Int), fixedSamplerIndex);
             IRInst* samplerVal = nullptr;
             if (useSamplerHeapIntrinsic)
             {
@@ -1363,12 +1392,12 @@ struct BindlessResourceLoweringContext
                     samplerType,
                     kIROp_LoadSamplerDescriptorFromHeap,
                     1,
-                    &samplerIndexLiteral);
+                    &samplerIndex);
             }
             else
             {
                 auto samplerHeap = getOrCreateResourceHeap(0, samplerType);
-                auto samplerPtr = builder.emitElementAddress(samplerHeap, samplerIndexLiteral);
+                auto samplerPtr = builder.emitElementAddress(samplerHeap, samplerIndex);
                 samplerVal = builder.emitLoad(samplerType, samplerPtr);
             }
 
@@ -1468,7 +1497,62 @@ struct BindlessResourceLoweringContext
         }
     }
 
-    void convertResourceWithResolver(IRGlobalParam* param, IRType* resourceType, int index)
+    void addConvertedResourceInfo(
+        const String& name,
+        IRType* originalType,
+        IRType* resourceType,
+        int index,
+        int binding,
+        int bindingCount,
+        BindlessResourceType bindlessResourceType)
+    {
+        if (!outConvertedResources)
+            return;
+
+        BindlessConvertedResource info;
+        info.name = name;
+        info.typeName = getResourceTypeName(originalType);
+        info.index = index;
+        info.binding = binding;
+        info.bindingCount = bindingCount;
+        info.resourceType = bindlessResourceType;
+        getArrayResourceInfo(originalType, info.isArray, info.arraySize);
+        if (info.isArray && info.arraySize < 0 && bindingCount > 0)
+            info.arraySize = bindingCount;
+        info.access = getResourceAccess(resourceType);
+        outConvertedResources->add(info);
+    }
+
+    void addConvertedResourceInfoForTextureSampler(
+        const String& name,
+        IRType* originalType,
+        int index,
+        int bindingCount)
+    {
+        if (!outConvertedResources)
+            return;
+
+        BindlessConvertedResource info;
+        info.name = name;
+        info.typeName = "SamplerState";
+        info.index = index;
+        info.binding = 0;
+        info.bindingCount = bindingCount;
+        info.resourceType = BindlessResourceType::Sampler;
+        getArrayResourceInfo(originalType, info.isArray, info.arraySize);
+        if (info.isArray && info.arraySize < 0 && bindingCount > 0)
+            info.arraySize = bindingCount;
+        info.access = SLANG_RESOURCE_ACCESS_READ;
+        outConvertedResources->add(info);
+    }
+
+    void convertResourceWithIndexSlot(
+        IRGlobalParam* param,
+        IRType* resourceType,
+        int index,
+        int bindingCount,
+        int samplerIndex,
+        int samplerBindingCount)
     {
         auto nameHint = param->findDecoration<IRNameHintDecoration>();
         String name = nameHint->getName();
@@ -1485,6 +1569,12 @@ struct BindlessResourceLoweringContext
                 continue;
 
             auto indexLiteral = builder.getIntValue(builder.getBasicType(BaseType::Int), index);
+            IRInst* samplerIndexLiteral = nullptr;
+            if (samplerIndex >= 0)
+            {
+                samplerIndexLiteral =
+                    builder.getIntValue(builder.getBasicType(BaseType::Int), samplerIndex);
+            }
             if (!isInsideFunction(user))
             {
                 if (tryRewriteAsmImageTypeOperandUse(name, resourceType, use, indexLiteral))
@@ -1493,26 +1583,42 @@ struct BindlessResourceLoweringContext
             }
 
             builder.setInsertBefore(user);
-            rewriteResourceUseWithHeapIndex(builder, name, resourceType, use, indexLiteral);
+            rewriteResourceUseWithHeapIndex(
+                builder,
+                name,
+                resourceType,
+                use,
+                indexLiteral,
+                samplerIndexLiteral);
         }
 
-        if (outConvertedResources)
-        {
-            BindlessConvertedResource info;
-            info.name = name;
-            info.typeName = getResourceTypeName(resourceType);
-            info.index = index;
-            info.resourceType = getBindlessResourceTypeForIRType(resourceType);
-            getArrayResourceInfo(param->getDataType(), info.isArray, info.arraySize);
-            info.access = getResourceAccess(resourceType);
-            outConvertedResources->add(info);
-        }
+        IRType* lookupType = getUncombinedTextureType(builder, resourceType);
+        addConvertedResourceInfo(
+            name,
+            resourceType,
+            lookupType,
+            index,
+            getBindingIndexForResourceType(lookupType),
+            bindingCount,
+            getBindlessResourceTypeForIRType(lookupType));
+        if (samplerIndex >= 0)
+            addConvertedResourceInfoForTextureSampler(
+                name,
+                resourceType,
+                samplerIndex,
+                samplerBindingCount);
 
         if (!tryRemoveConvertedGlobalParam(param) && !param->hasUses())
             param->removeAndDeallocate();
     }
 
-    void convertArrayResourceWithResolver(IRGlobalParam* param, IRType* resourceType, int baseIndex)
+    void convertArrayResourceWithIndexSlot(
+        IRGlobalParam* param,
+        IRType* resourceType,
+        int baseIndex,
+        int bindingCount,
+        int samplerBaseIndex,
+        int samplerBindingCount)
     {
         auto nameHint = param->findDecoration<IRNameHintDecoration>();
         String name = nameHint->getName();
@@ -1549,13 +1655,18 @@ struct BindlessResourceLoweringContext
                     continue;
 
                 builder.setInsertBefore(elementUser);
-                auto effectiveIndex = buildArrayedDescriptorIndex(builder, baseIndex, userIndex);
+                auto effectiveIndex = buildIndexBufferSlot(builder, baseIndex, userIndex);
+                IRInst* effectiveSamplerIndex = nullptr;
+                if (samplerBaseIndex >= 0)
+                    effectiveSamplerIndex =
+                        buildIndexBufferSlot(builder, samplerBaseIndex, userIndex);
                 rewriteResourceUseWithHeapIndex(
                     builder,
                     name,
                     resourceType,
                     elementUse,
                     effectiveIndex,
+                    effectiveSamplerIndex,
                     hasNonUniformUserIndex);
             }
 
@@ -1564,17 +1675,21 @@ struct BindlessResourceLoweringContext
             removeDeadNonUniformIndexWrappers(originalUserIndex);
         }
 
-        if (outConvertedResources)
-        {
-            BindlessConvertedResource info;
-            info.name = name;
-            info.typeName = getResourceTypeName(param->getDataType());
-            info.index = baseIndex;
-            info.resourceType = getBindlessResourceTypeForIRType(resourceType);
-            getArrayResourceInfo(param->getDataType(), info.isArray, info.arraySize);
-            info.access = getResourceAccess(resourceType);
-            outConvertedResources->add(info);
-        }
+        IRType* lookupType = getUncombinedTextureType(builder, resourceType);
+        addConvertedResourceInfo(
+            name,
+            param->getDataType(),
+            lookupType,
+            baseIndex,
+            getBindingIndexForResourceType(lookupType),
+            bindingCount,
+            getBindlessResourceTypeForIRType(lookupType));
+        if (samplerBaseIndex >= 0)
+            addConvertedResourceInfoForTextureSampler(
+                name,
+                param->getDataType(),
+                samplerBaseIndex,
+                samplerBindingCount);
 
         if (!tryRemoveConvertedGlobalParam(param) && !param->hasUses())
             param->removeAndDeallocate();

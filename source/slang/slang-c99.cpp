@@ -75,24 +75,10 @@ struct SlangcCompilerImpl
 
     bool needsSessionRecreate = true;
 
-    // Bindless resolver callback (set once, used for all programs)
-    SlangcBindlessResolverCallback bindlessResolver = nullptr;
-    void* bindlessResolverUserData = nullptr;
-
-    // Bindless array resolver callback (set once, used for all programs)
-    SlangcBindlessArrayResolverCallback bindlessArrayResolver = nullptr;
-    void* bindlessArrayResolverUserData = nullptr;
-
-    // Bindless combined-sampler resolver callback (set once, used for all programs)
-    SlangcBindlessCombinedSamplerResolverCallback bindlessCombinedSamplerResolver = nullptr;
-    void* bindlessCombinedSamplerResolverUserData = nullptr;
-
     SlangcFragmentOutputResolverCallback fragmentOutputResolver = nullptr;
     void* fragmentOutputResolverUserData = nullptr;
-
-    // Cache for bindless resolver results (resourceName:resourceType -> index)
-    // Persists across programs to avoid redundant callback invocations
-    Slang::Dictionary<Slang::String, int> bindlessResolverCache;
+    SlangcBindlessArraySizeResolverCallback bindlessArraySizeResolver = nullptr;
+    void* bindlessArraySizeResolverUserData = nullptr;
 
     // Per-instance file system (NOT static - each compiler instance needs its own)
     CallbackFileSystem* callbackFs = nullptr;
@@ -114,6 +100,7 @@ struct ResourceInfoStorage
     int set;
     int binding;
     int bindlessIndex;
+    int bindingCount;
     SlangcResourceObjectType objectType;
     int isArray;
     int arraySize;
@@ -127,33 +114,15 @@ struct EntryPointInfo
     SlangcStage stage;
 };
 
-//
-// Bindless resolver wrapper for caching
-// Defined early so it can be used in SlangcProgramImpl
-//
-
-struct BindlessResolverWrapper
-{
-    SlangcBindlessResolverCallback userCallback;
-    void* userCallbackData;
-    Slang::Dictionary<Slang::String, int>* cache;  // Compiler's cache
-};
-
-struct BindlessArrayResolverWrapper
-{
-    SlangcBindlessArrayResolverCallback userCallback;
-    void* userCallbackData;
-};
-
-struct BindlessCombinedSamplerResolverWrapper
-{
-    SlangcBindlessCombinedSamplerResolverCallback userCallback;
-    void* userCallbackData;
-};
-
 struct FragmentOutputResolverWrapper
 {
     SlangcFragmentOutputResolverCallback userCallback;
+    void* userCallbackData;
+};
+
+struct BindlessArraySizeResolverWrapper
+{
+    SlangcBindlessArraySizeResolverCallback userCallback;
     void* userCallbackData;
 };
 
@@ -164,7 +133,6 @@ struct SlangcProgramImpl
     // Pre-link state
     std::vector<slang::IModule*> modules;
     std::vector<EntryPointInfo> entryPoints;
-    std::unordered_map<std::string, int> bindlessIndices;
 
     // Specialization state (pre-link)
     // Positional args (traditional API)
@@ -178,11 +146,8 @@ struct SlangcProgramImpl
     ComPtr<slang::IComponentType> composedProgram;
     bool needsRecompose = true;
 
-    // Wrapper for passing resolver to internal API (created during link from compiler's resolver)
-    std::unique_ptr<BindlessResolverWrapper> resolverWrapper;
-    std::unique_ptr<BindlessArrayResolverWrapper> arrayResolverWrapper;
-    std::unique_ptr<BindlessCombinedSamplerResolverWrapper> combinedSamplerResolverWrapper;
     std::unique_ptr<FragmentOutputResolverWrapper> fragmentOutputResolverWrapper;
+    std::unique_ptr<BindlessArraySizeResolverWrapper> bindlessArraySizeResolverWrapper;
 
     // Post-link state
     ComPtr<slang::IComponentType> linkedProgram;
@@ -191,8 +156,6 @@ struct SlangcProgramImpl
 
     std::vector<ResourceInfoStorage> resources;
     std::vector<ResourceInfoStorage> bindlessResources;
-    std::vector<ResourceInfoStorage> unmappedResources;
-
     std::vector<std::string> entryPointNames;
     std::vector<SlangcStage> entryPointStages;
 
@@ -206,14 +169,6 @@ struct SlangcBlobImpl
 {
     ComPtr<slang::IBlob> blob;
 };
-
-// Make a cache key from resource name and type
-static Slang::String makeCacheKey(const char* name, int resourceType)
-{
-    Slang::StringBuilder sb;
-    sb << name << ":" << resourceType;
-    return sb.produceString();
-}
 
 // Convert from internal SlangResourceAccess to C99 SlangcResourceAccess
 static SlangcResourceAccess toC99Access(SlangResourceAccess access)
@@ -270,6 +225,20 @@ static int toC99ArraySize(size_t arraySize)
     return int(arraySize);
 }
 
+static int bindlessArraySizeResolverWrapperCallback(
+    const char* resourceName,
+    slang::SlangBindlessResourceType resourceType,
+    void* userData)
+{
+    auto* wrapper = static_cast<BindlessArraySizeResolverWrapper*>(userData);
+    if (!wrapper || !wrapper->userCallback)
+        return -1;
+    return wrapper->userCallback(
+        resourceName,
+        toC99ObjectType(resourceType),
+        wrapper->userCallbackData);
+}
+
 static void clearResourceInfo(SlangcResourceInfo* outInfo)
 {
     outInfo->name = nullptr;
@@ -277,6 +246,7 @@ static void clearResourceInfo(SlangcResourceInfo* outInfo)
     outInfo->set = -1;
     outInfo->binding = -1;
     outInfo->bindlessIndex = -1;
+    outInfo->bindingCount = 0;
     outInfo->objectType = SLANGC_RESOURCE_OBJECT_UNKNOWN;
     outInfo->isArray = 0;
     outInfo->arraySize = 0;
@@ -290,6 +260,7 @@ static void copyResourceInfo(const ResourceInfoStorage& info, SlangcResourceInfo
     outInfo->set = info.set;
     outInfo->binding = info.binding;
     outInfo->bindlessIndex = info.bindlessIndex;
+    outInfo->bindingCount = info.bindingCount;
     outInfo->objectType = info.objectType;
     outInfo->isArray = info.isArray;
     outInfo->arraySize = info.arraySize;
@@ -385,71 +356,6 @@ static int combineArraySize(int lhs, int rhs)
     if (combinedSize > std::numeric_limits<int>::max())
         return -1;
     return int(combinedSize);
-}
-
-// Wrapper callback that handles caching
-// Takes slang::SlangBindlessResourceType (from slang.h) and converts to SlangcBindlessResourceType (for user callback)
-static int bindlessResolverWrapperCallback(
-    const char* resourceName,
-    slang::SlangBindlessResourceType resourceType,
-    void* userData)
-{
-    auto* wrapper = static_cast<BindlessResolverWrapper*>(userData);
-    if (!wrapper || !wrapper->userCallback)
-        return -1;
-
-    // Check cache first
-    Slang::String cacheKey = makeCacheKey(resourceName, (int)resourceType);
-    if (wrapper->cache)
-    {
-        if (auto* cachedIndex = wrapper->cache->tryGetValue(cacheKey))
-            return *cachedIndex;
-    }
-
-    // Convert to C99 enum type for user callback (values are identical)
-    SlangcBindlessResourceType c99Type = static_cast<SlangcBindlessResourceType>(resourceType);
-
-    // Call user callback
-    int result = wrapper->userCallback(resourceName, c99Type, wrapper->userCallbackData);
-
-    // Cache the result if valid
-    if (wrapper->cache && result >= 0)
-    {
-        wrapper->cache->add(cacheKey, result);
-    }
-
-    return result;
-}
-
-static int bindlessArrayResolverWrapperCallback(
-    const char* resourceName,
-    slang::SlangBindlessResourceType resourceType,
-    int shaderArrayLength,
-    int* outResolvedArrayLength,
-    void* userData)
-{
-    auto* wrapper = static_cast<BindlessArrayResolverWrapper*>(userData);
-    if (!wrapper || !wrapper->userCallback)
-        return -1;
-
-    SlangcBindlessResourceType c99Type = static_cast<SlangcBindlessResourceType>(resourceType);
-    return wrapper->userCallback(
-        resourceName,
-        c99Type,
-        shaderArrayLength,
-        outResolvedArrayLength,
-        wrapper->userCallbackData);
-}
-
-static int bindlessCombinedSamplerResolverWrapperCallback(
-    const char* resourceName,
-    void* userData)
-{
-    auto* wrapper = static_cast<BindlessCombinedSamplerResolverWrapper*>(userData);
-    if (!wrapper || !wrapper->userCallback)
-        return -1;
-
-    return wrapper->userCallback(resourceName, wrapper->userCallbackData);
 }
 
 static int fragmentOutputResolverWrapperCallback(const char* outputName, void* userData)
@@ -967,53 +873,6 @@ SLANGC_API void slangc_addEntryPoint(
     impl->entryPoints.push_back(info);
 }
 
-SLANGC_API void slangc_setBindlessResourceIndex(
-    SlangcProgram program,
-    const char* resourceName,
-    int index)
-{
-    auto impl = static_cast<SlangcProgramImpl*>(program);
-    if (!impl || !resourceName)
-        return;
-    impl->bindlessIndices[resourceName] = index;
-}
-
-SLANGC_API void slangc_setBindlessResolver(
-    SlangcCompiler compiler,
-    SlangcBindlessResolverCallback callback,
-    void* userData)
-{
-    auto impl = static_cast<SlangcCompilerImpl*>(compiler);
-    if (!impl)
-        return;
-    impl->bindlessResolver = callback;
-    impl->bindlessResolverUserData = userData;
-}
-
-SLANGC_API void slangc_setBindlessArrayResolver(
-    SlangcCompiler compiler,
-    SlangcBindlessArrayResolverCallback callback,
-    void* userData)
-{
-    auto impl = static_cast<SlangcCompilerImpl*>(compiler);
-    if (!impl)
-        return;
-    impl->bindlessArrayResolver = callback;
-    impl->bindlessArrayResolverUserData = userData;
-}
-
-SLANGC_API void slangc_setBindlessCombinedSamplerResolver(
-    SlangcCompiler compiler,
-    SlangcBindlessCombinedSamplerResolverCallback callback,
-    void* userData)
-{
-    auto impl = static_cast<SlangcCompilerImpl*>(compiler);
-    if (!impl)
-        return;
-    impl->bindlessCombinedSamplerResolver = callback;
-    impl->bindlessCombinedSamplerResolverUserData = userData;
-}
-
 SLANGC_API void slangc_setFragmentOutputResolver(
     SlangcCompiler compiler,
     SlangcFragmentOutputResolverCallback callback,
@@ -1024,6 +883,18 @@ SLANGC_API void slangc_setFragmentOutputResolver(
         return;
     impl->fragmentOutputResolver = callback;
     impl->fragmentOutputResolverUserData = userData;
+}
+
+SLANGC_API void slangc_setBindlessArraySizeResolver(
+    SlangcCompiler compiler,
+    SlangcBindlessArraySizeResolverCallback callback,
+    void* userData)
+{
+    auto impl = static_cast<SlangcCompilerImpl*>(compiler);
+    if (!impl)
+        return;
+    impl->bindlessArraySizeResolver = callback;
+    impl->bindlessArraySizeResolverUserData = userData;
 }
 
 /*
@@ -1229,81 +1100,6 @@ SLANGC_API int slangc_link(SlangcProgram program)
     impl->linkedProgram = linkedProgram;
     impl->isLinked = true;
 
-    // Set bindless config on the LINKED program (it has its own TargetProgram)
-    // This must be done AFTER link() but BEFORE getTargetCode()
-    ComPtr<slang::IComponentType3> linkedComp3;
-    if (SLANG_SUCCEEDED(linkedProgram->queryInterface(
-        slang::IComponentType3::getTypeGuid(),
-        (void**)linkedComp3.writeRef())))
-    {
-        // Set static bindless indices
-        if (!impl->bindlessIndices.empty())
-        {
-            std::vector<const char*> names;
-            std::vector<SlangInt> indices;
-            for (const auto& [name, index] : impl->bindlessIndices)
-            {
-                names.push_back(name.c_str());
-                indices.push_back(index);
-            }
-            linkedComp3->setBindlessResourceIndexMap(
-                0, names.data(), indices.data(), (SlangInt)names.size());
-        }
-
-        // Set resolver callback (runs during IR lowering, after DCE)
-        if (compiler->bindlessResolver)
-        {
-            impl->resolverWrapper = std::make_unique<BindlessResolverWrapper>();
-            impl->resolverWrapper->userCallback = compiler->bindlessResolver;
-            impl->resolverWrapper->userCallbackData = compiler->bindlessResolverUserData;
-            impl->resolverWrapper->cache = &compiler->bindlessResolverCache;
-
-            linkedComp3->setBindlessResolver(
-                0,
-                bindlessResolverWrapperCallback,
-                impl->resolverWrapper.get());
-        }
-    }
-
-    ComPtr<slang::IComponentType4> linkedComp4;
-    if (SLANG_SUCCEEDED(linkedProgram->queryInterface(
-        slang::IComponentType4::getTypeGuid(),
-        (void**)linkedComp4.writeRef())))
-    {
-        if (compiler->bindlessArrayResolver)
-        {
-            impl->arrayResolverWrapper = std::make_unique<BindlessArrayResolverWrapper>();
-            impl->arrayResolverWrapper->userCallback = compiler->bindlessArrayResolver;
-            impl->arrayResolverWrapper->userCallbackData = compiler->bindlessArrayResolverUserData;
-
-            linkedComp4->setBindlessArrayResolver(
-                0,
-                bindlessArrayResolverWrapperCallback,
-                impl->arrayResolverWrapper.get());
-        }
-    }
-
-    ComPtr<slang::IComponentType5> linkedComp5;
-    if (SLANG_SUCCEEDED(linkedProgram->queryInterface(
-        slang::IComponentType5::getTypeGuid(),
-        (void**)linkedComp5.writeRef())))
-    {
-        if (compiler->bindlessCombinedSamplerResolver)
-        {
-            impl->combinedSamplerResolverWrapper =
-                std::make_unique<BindlessCombinedSamplerResolverWrapper>();
-            impl->combinedSamplerResolverWrapper->userCallback =
-                compiler->bindlessCombinedSamplerResolver;
-            impl->combinedSamplerResolverWrapper->userCallbackData =
-                compiler->bindlessCombinedSamplerResolverUserData;
-
-            linkedComp5->setBindlessCombinedSamplerResolver(
-                0,
-                bindlessCombinedSamplerResolverWrapperCallback,
-                impl->combinedSamplerResolverWrapper.get());
-        }
-    }
-
     if (compiler->fragmentOutputResolver)
     {
         ComPtr<slang::IComponentType6> linkedComp6;
@@ -1324,6 +1120,30 @@ SLANGC_API int slangc_link(SlangcProgram program)
             0,
             fragmentOutputResolverWrapperCallback,
             impl->fragmentOutputResolverWrapper.get());
+    }
+
+    if (compiler->bindlessArraySizeResolver)
+    {
+        ComPtr<slang::IComponentType7> linkedComp7;
+        if (SLANG_FAILED(linkedProgram->queryInterface(
+                slang::IComponentType7::getTypeGuid(),
+                (void**)linkedComp7.writeRef())))
+        {
+            impl->appendError("Linked program does not support bindless array size resolver");
+            return 0;
+        }
+
+        impl->bindlessArraySizeResolverWrapper =
+            std::make_unique<BindlessArraySizeResolverWrapper>();
+        impl->bindlessArraySizeResolverWrapper->userCallback =
+            compiler->bindlessArraySizeResolver;
+        impl->bindlessArraySizeResolverWrapper->userCallbackData =
+            compiler->bindlessArraySizeResolverUserData;
+
+        linkedComp7->setBindlessArraySizeResolver(
+            0,
+            bindlessArraySizeResolverWrapperCallback,
+            impl->bindlessArraySizeResolverWrapper.get());
     }
 
     // Get compiled code
@@ -1389,6 +1209,7 @@ SLANGC_API int slangc_link(SlangcProgram program)
         info.set = -1;
         info.binding = -1;
         info.bindlessIndex = -1;
+        info.bindingCount = info.isArray ? info.arraySize : 1;
         info.objectType = classifyResourceObjectType(type);
         info.isArray = effectiveArraySize != 0 ? 1 : 0;
         info.arraySize = effectiveArraySize;
@@ -1461,6 +1282,7 @@ SLANGC_API int slangc_link(SlangcProgram program)
                 info.set = (int)res.set;
                 info.binding = (int)res.binding;
                 info.bindlessIndex = (int)res.index;
+                info.bindingCount = (int)res.bindingCount;
                 info.objectType = toC99ObjectType(res.resourceType);
                 info.isArray = res.isArray ? 1 : 0;
                 info.arraySize = (int)res.arraySize;
@@ -1568,26 +1390,14 @@ SLANGC_API int slangc_getBindlessResource(SlangcProgram program, int index, Slan
     return 1;
 }
 
-SLANGC_API int slangc_getUnmappedResourceCount(SlangcProgram program)
+SLANGC_API int slangc_getUsedBindingCount(SlangcProgram program)
 {
-    auto impl = static_cast<SlangcProgramImpl*>(program);
-    return impl ? (int)impl->unmappedResources.size() : 0;
+    return slangc_getBindlessResourceCount(program);
 }
 
-SLANGC_API int slangc_getUnmappedResource(SlangcProgram program, int index, SlangcResourceInfo* outInfo)
+SLANGC_API int slangc_getUsedBinding(SlangcProgram program, int index, SlangcResourceInfo* outInfo)
 {
-    if (!outInfo)
-        return 0;
-
-    auto impl = static_cast<SlangcProgramImpl*>(program);
-    if (!impl || index < 0 || index >= (int)impl->unmappedResources.size())
-    {
-        clearResourceInfo(outInfo);
-        return 0;
-    }
-
-    copyResourceInfo(impl->unmappedResources[index], outInfo);
-    return 1;
+    return slangc_getBindlessResource(program, index, outInfo);
 }
 
 SLANGC_API int slangc_getEntryPointCount(SlangcProgram program)

@@ -98,10 +98,8 @@ private:
 class ComponentType : public RefObject,
                       public slang::IComponentType,
                       public slang::IComponentType2,
-                      public slang::IComponentType3,
-                      public slang::IComponentType4,
-                      public slang::IComponentType5,
                       public slang::IComponentType6,
+                      public slang::IComponentType7,
                       public slang::IModulePrecompileService_Experimental
 {
 public:
@@ -195,41 +193,19 @@ public:
         slang::IBlob** outDiagnostics) SLANG_OVERRIDE;
 
     //
-    // slang::IComponentType3 interface
-    //
-    SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessResourceIndexMap(
-        SlangInt targetIndex,
-        const char* const* names,
-        const SlangInt* indices,
-        SlangInt count) SLANG_OVERRIDE;
-
-    SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessResolver(
-        SlangInt targetIndex,
-        slang::SlangBindlessResolverCallback callback,
-        void* userData) SLANG_OVERRIDE;
-
-    //
-    // slang::IComponentType4 interface
-    //
-    SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessArrayResolver(
-        SlangInt targetIndex,
-        slang::SlangBindlessArrayResolverCallback callback,
-        void* userData) SLANG_OVERRIDE;
-
-    //
-    // slang::IComponentType5 interface
-    //
-    SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessCombinedSamplerResolver(
-        SlangInt targetIndex,
-        slang::SlangBindlessCombinedSamplerResolverCallback callback,
-        void* userData) SLANG_OVERRIDE;
-
-    //
     // slang::IComponentType6 interface
     //
     SLANG_NO_THROW SlangResult SLANG_MCALL setFragmentOutputResolver(
         SlangInt targetIndex,
         slang::SlangFragmentOutputResolverCallback callback,
+        void* userData) SLANG_OVERRIDE;
+
+    //
+    // slang::IComponentType7 interface
+    //
+    SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessArraySizeResolver(
+        SlangInt targetIndex,
+        slang::SlangBindlessArraySizeResolverCallback callback,
         void* userData) SLANG_OVERRIDE;
 
     //

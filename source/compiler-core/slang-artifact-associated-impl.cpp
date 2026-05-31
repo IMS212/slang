@@ -289,6 +289,8 @@ void* ArtifactPostEmitMetadata::getInterface(const Guid& guid)
     }
     if (guid == slang::IMetadata::getTypeGuid())
         return static_cast<slang::IMetadata*>(this);
+    if (guid == slang::IBindlessResourceUsageMetadata::getTypeGuid())
+        return static_cast<slang::IBindlessResourceUsageMetadata*>(this);
     if (guid == slang::ICoverageTracingMetadata::getTypeGuid())
     {
         return static_cast<slang::ICoverageTracingMetadata*>(this);
@@ -485,6 +487,39 @@ Slice<BindlessResourceInfo> ArtifactPostEmitMetadata::getBindlessConvertedResour
     return Slice<BindlessResourceInfo>(
         m_bindlessConvertedResources.getBuffer(),
         m_bindlessConvertedResources.getCount());
+}
+
+SlangUInt ArtifactPostEmitMetadata::getBindlessResourceUsageCount()
+{
+    return SlangUInt(m_bindlessConvertedResources.getCount());
+}
+
+static constexpr size_t kBindlessResourceUsageInfoV1MinSize =
+    offsetof(slang::BindlessResourceUsageInfo, access) + sizeof(SlangResourceAccess);
+
+SlangResult ArtifactPostEmitMetadata::getBindlessResourceUsage(
+    SlangUInt index,
+    slang::BindlessResourceUsageInfo* outInfo)
+{
+    if (!outInfo)
+        return SLANG_E_INVALID_ARG;
+    if (outInfo->structSize < kBindlessResourceUsageInfoV1MinSize)
+        return SLANG_E_INVALID_ARG;
+    if (index >= SlangUInt(m_bindlessConvertedResources.getCount()))
+        return SLANG_E_INVALID_ARG;
+
+    const auto& resource = m_bindlessConvertedResources[Index(index)];
+    outInfo->name = resource.name.begin();
+    outInfo->typeName = resource.typeName.begin();
+    outInfo->set = resource.set;
+    outInfo->binding = resource.binding;
+    outInfo->index = resource.index;
+    outInfo->bindingCount = resource.bindingCount;
+    outInfo->resourceType = SlangInt(resource.resourceType);
+    outInfo->isArray = resource.isArray;
+    outInfo->arraySize = resource.arraySize;
+    outInfo->access = resource.access;
+    return SLANG_OK;
 }
 
 } // namespace Slang

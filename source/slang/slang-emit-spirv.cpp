@@ -6983,6 +6983,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         auto valueType = ptrType->getValueType();
         switch (storageClass)
         {
+        case SpvStorageClassUniform:
         case SpvStorageClassPhysicalStorageBuffer:
         case SpvStorageClassStorageBuffer:
             if (auto arrayType = as<IRArrayTypeBase>(unwrapAttributedType(valueType)))

@@ -184,6 +184,7 @@ struct CoverageTracingEntry
 
 class ArtifactPostEmitMetadata : public ComBaseObject,
                                  public IArtifactPostEmitMetadata,
+                                 public slang::IBindlessResourceUsageMetadata,
                                  public slang::ICoverageTracingMetadata,
                                  public slang::ICooperativeTypesMetadata
 {
@@ -204,6 +205,12 @@ public:
         SLANG_OVERRIDE;
     SLANG_NO_THROW virtual Slice<BindlessResourceInfo> SLANG_MCALL getBindlessConvertedResources()
         SLANG_OVERRIDE;
+
+    // IBindlessResourceUsageMetadata
+    SLANG_NO_THROW virtual SlangUInt SLANG_MCALL getBindlessResourceUsageCount() SLANG_OVERRIDE;
+    SLANG_NO_THROW virtual SlangResult SLANG_MCALL getBindlessResourceUsage(
+        SlangUInt index,
+        slang::BindlessResourceUsageInfo* outInfo) SLANG_OVERRIDE;
 
     // IMetadata
     SLANG_NO_THROW virtual SlangResult isParameterLocationUsed(

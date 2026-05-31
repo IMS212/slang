@@ -4518,6 +4518,62 @@ struct IMetadata : public ISlangCastable
 };
     #define SLANG_UUID_IMetadata IMetadata::getTypeGuid()
 
+struct BindlessResourceUsageInfo
+{
+    size_t structSize = sizeof(BindlessResourceUsageInfo);
+
+    /// Original resource name. The returned pointer is valid for the lifetime of the metadata.
+    const char* name = nullptr;
+
+    /// Resource type name, for example `Texture2D`, `SamplerState`, or `RWStructuredBuffer`.
+    const char* typeName = nullptr;
+
+    /// Descriptor set/space containing the descriptor heap that this resource reads.
+    SlangInt set = -1;
+
+    /// Binding within `set` containing the descriptor heap that this resource reads.
+    SlangInt binding = -1;
+
+    /// Base slot in the generated bindless index buffer. For arrays, the shader adds the
+    /// user array index before reading this index-buffer slot.
+    SlangInt index = -1;
+
+    /// Number of index-buffer slots required by this resource. `-1` means unsized.
+    SlangInt bindingCount = 0;
+
+    /// SlangBindlessResourceType value. Stored as SlangInt for ABI stability.
+    SlangInt resourceType = -1;
+
+    /// Non-zero if this resource is an array.
+    SlangInt isArray = 0;
+
+    /// `-1` for unsized arrays, otherwise the total array element count. `0` if not an array.
+    SlangInt arraySize = 0;
+
+    /// Resource access mode.
+    SlangResourceAccess access = SLANG_RESOURCE_ACCESS_READ;
+};
+
+struct IBindlessResourceUsageMetadata : public ISlangCastable
+{
+    SLANG_COM_INTERFACE(
+        0xe3f5b31d,
+        0x53a5,
+        0x4d33,
+        {0xa0, 0x8b, 0xa6, 0x88, 0x5f, 0x4f, 0x3e, 0x1b})
+
+    /// Number of resources converted to automatic bindless index-buffer access.
+    virtual SLANG_NO_THROW SlangUInt SLANG_MCALL getBindlessResourceUsageCount() = 0;
+
+    /// Populate `outInfo` with bindless resource usage for `index`.
+    /// The caller must pre-set `outInfo->structSize = sizeof(BindlessResourceUsageInfo)`.
+    virtual SLANG_NO_THROW SlangResult SLANG_MCALL getBindlessResourceUsage(
+        SlangUInt index,
+        BindlessResourceUsageInfo* outInfo) = 0;
+};
+    #define SLANG_UUID_IBindlessResourceUsageMetadata \
+        IBindlessResourceUsageMetadata::getTypeGuid()
+
 /** Coverage tracing metadata produced when `-trace-coverage` is active.
 
 Each counter slot in the synthesized coverage buffer maps to a source
@@ -5033,7 +5089,7 @@ struct IComponentType2 : public ISlangUnknown
 };
     #define SLANG_UUID_IComponentType2 IComponentType2::getTypeGuid()
 
-/** Bindless resource type for resolver callback.
+/** Automatic bindless resource heap category.
 These correspond to different descriptor heap bindings (0-5).
 */
 enum SlangBindlessResourceType
@@ -5046,45 +5102,6 @@ enum SlangBindlessResourceType
     SLANG_BINDLESS_RESOURCE_TYPE_STORAGE_BUFFER = 5,     // StructuredBuffer, ByteAddressBuffer, etc.
 };
 
-/** Callback type for resolving bindless resource indices.
-Called during IR lowering (after DCE) for each actually-used resource.
-@param resourceName The name of the resource
-@param resourceType The type category (determines which heap binding)
-@param userData User-provided context pointer
-@return Descriptor heap index for this resource, or -1 to skip (not bindless)
-*/
-typedef int (*SlangBindlessResolverCallback)(
-    const char* resourceName,
-    SlangBindlessResourceType resourceType,
-    void* userData);
-
-/** Callback type for resolving bindless resource array base indices.
-Called during IR lowering (after DCE) for each actually-used resource array.
-@param resourceName The name of the resource array
-@param resourceType The type category (determines which heap binding)
-@param shaderArrayLength The array length declared in shader, or -1 for unsized arrays
-@param outResolvedArrayLength Resolver must write resolved array length here
-@param userData User-provided context pointer
-@return Base descriptor heap index for this resource array, or -1 to skip (not bindless)
-*/
-typedef int (*SlangBindlessArrayResolverCallback)(
-    const char* resourceName,
-    SlangBindlessResourceType resourceType,
-    int shaderArrayLength,
-    int* outResolvedArrayLength,
-    void* userData);
-
-/** Callback type for resolving fixed sampler indices used when lowering
-combined texture-sampler resources (e.g. `Sampler2D`) to texture + sampler pairs.
-Called during IR lowering for each actually-used combined texture resource.
-@param resourceName The name of the combined texture resource
-@param userData User-provided context pointer
-@return Sampler descriptor heap index for this resource. Return < 0 to use default index 0.
-*/
-typedef int (*SlangBindlessCombinedSamplerResolverCallback)(
-    const char* resourceName,
-    void* userData);
-
 /** Callback type for resolving SPIR-V fragment color output locations.
 @param outputName The fragment output member name, such as "color" or "normal"
 @param userData User-provided context pointer
@@ -5092,105 +5109,16 @@ typedef int (*SlangBindlessCombinedSamplerResolverCallback)(
 */
 typedef int (*SlangFragmentOutputResolverCallback)(const char* outputName, void* userData);
 
-/** IComponentType3 provides support for bindless resource lowering.
-
-This interface allows setting a map from resource names to bindless descriptor indices.
-When set, the compiler will convert resources to use DescriptorHandle<T> and index
-the corresponding descriptor heap directly with those indices.
-
-The map should be set before calling link() or getEntryPointCode().
+/** Callback type for resolving the runtime size of unsized automatic bindless resource arrays.
+@param resourceName The resource variable name, such as "textures"
+@param resourceType The automatic bindless resource heap category for the array element type
+@param userData User-provided context pointer
+@return Number of array elements/index-buffer slots to reserve, or a non-positive value if unresolved
 */
-struct IComponentType3 : public ISlangUnknown
-{
-    SLANG_COM_INTERFACE(
-        0x7b3e5c2a,
-        0x1d8f,
-        0x4a92,
-        {0xb6, 0x43, 0x9e, 0x72, 0x1c, 0xa8, 0x5d, 0x2b})
-
-    /** Set the bindless resource index map for a specific target.
-
-    @param targetIndex The target index to configure
-    @param names Array of resource names
-    @param indices Array of index values corresponding to each name
-    @param count Number of entries in the arrays
-    @return SLANG_OK on success
-    */
-    virtual SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessResourceIndexMap(
-        SlangInt targetIndex,
-        const char* const* names,
-        const SlangInt* indices,
-        SlangInt count) = 0;
-
-    /** Set a bindless resolver callback for dynamic index resolution.
-    The callback is invoked during IR lowering (after DCE) for each used resource.
-    Results are cached using the provided cache key-value store.
-
-    @param targetIndex The target index to configure
-    @param callback The resolver callback function
-    @param userData User data passed to the callback
-    @return SLANG_OK on success
-    */
-    virtual SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessResolver(
-        SlangInt targetIndex,
-        SlangBindlessResolverCallback callback,
-        void* userData) = 0;
-};
-    #define SLANG_UUID_IComponentType3 IComponentType3::getTypeGuid()
-
-/** IComponentType4 provides support for bindless resource array lowering.
-
-This interface allows setting a callback to resolve bindless base indices for
-arrayed resources (e.g. `Texture2D[]`).
-*/
-struct IComponentType4 : public ISlangUnknown
-{
-    SLANG_COM_INTERFACE(
-        0xa13b4fd1,
-        0xfde5,
-        0x41d8,
-        {0xb4, 0x71, 0xe0, 0x76, 0x38, 0x9e, 0x8b, 0x5f})
-
-    /** Set a bindless array resolver callback for dynamic base-index resolution.
-    The callback is invoked during IR lowering (after DCE) for each used resource array.
-
-    @param targetIndex The target index to configure
-    @param callback The array resolver callback function
-    @param userData User data passed to the callback
-    @return SLANG_OK on success
-    */
-    virtual SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessArrayResolver(
-        SlangInt targetIndex,
-        SlangBindlessArrayResolverCallback callback,
-        void* userData) = 0;
-};
-    #define SLANG_UUID_IComponentType4 IComponentType4::getTypeGuid()
-
-/** IComponentType5 provides support for selecting fixed sampler indices
-for bindless lowering of combined texture-sampler resources.
-*/
-struct IComponentType5 : public ISlangUnknown
-{
-    SLANG_COM_INTERFACE(
-        0xe6e3f5bf,
-        0x8d3b,
-        0x4ad2,
-        {0x96, 0x17, 0xf4, 0x9f, 0x0a, 0x87, 0x1b, 0x66})
-
-    /** Set a callback for resolving the sampler descriptor index used when
-    lowering combined texture-sampler resources to texture + sampler pairs.
-
-    @param targetIndex The target index to configure
-    @param callback The combined-sampler resolver callback function
-    @param userData User data passed to the callback
-    @return SLANG_OK on success
-    */
-    virtual SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessCombinedSamplerResolver(
-        SlangInt targetIndex,
-        SlangBindlessCombinedSamplerResolverCallback callback,
-        void* userData) = 0;
-};
-    #define SLANG_UUID_IComponentType5 IComponentType5::getTypeGuid()
+typedef int (*SlangBindlessArraySizeResolverCallback)(
+    const char* resourceName,
+    SlangBindlessResourceType resourceType,
+    void* userData);
 
 /** IComponentType6 provides support for resolving SPIR-V fragment color output locations. */
 struct IComponentType6 : public ISlangUnknown
@@ -5214,6 +5142,29 @@ struct IComponentType6 : public ISlangUnknown
         void* userData) = 0;
 };
     #define SLANG_UUID_IComponentType6 IComponentType6::getTypeGuid()
+
+/** IComponentType7 provides target-level callbacks for automatic bindless lowering. */
+struct IComponentType7 : public ISlangUnknown
+{
+    SLANG_COM_INTERFACE(
+        0xd20a09fd,
+        0x2fde,
+        0x4566,
+        {0xa2, 0xdd, 0x48, 0xa9, 0xd3, 0x46, 0xf8, 0xd4})
+
+    /** Set a callback for resolving unsized bindless resource array lengths for a specific target.
+
+    @param targetIndex The target index to configure
+    @param callback The bindless array size resolver callback function
+    @param userData User data passed to the callback
+    @return SLANG_OK on success
+    */
+    virtual SLANG_NO_THROW SlangResult SLANG_MCALL setBindlessArraySizeResolver(
+        SlangInt targetIndex,
+        SlangBindlessArraySizeResolverCallback callback,
+        void* userData) = 0;
+};
+    #define SLANG_UUID_IComponentType7 IComponentType7::getTypeGuid()
 
 /** A module is the granularity of shader code compilation and loading.
 

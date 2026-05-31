@@ -131,7 +131,8 @@ struct BindlessResourceInfo
     TerminatedCharSlice typeName;   ///< Type of the resource (e.g., "Texture2D", "RWStructuredBuffer")
     SlangInt set;                   ///< Descriptor set/space containing the bindless heap
     SlangInt binding;               ///< Binding number of the bindless heap within `set`
-    SlangInt index;                 ///< Descriptor index within the bindless heap
+    SlangInt index;                 ///< Slot in the bindless index buffer
+    SlangInt bindingCount;          ///< Number of index-buffer slots required by this resource
     slang::SlangBindlessResourceType resourceType; ///< Bindless heap category for this resource
     SlangInt isArray;               ///< Non-zero if this resource is an array
     SlangInt arraySize;             ///< -1 for unsized arrays, otherwise total array element count
