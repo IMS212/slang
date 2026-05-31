@@ -151,6 +151,20 @@ function(set_default_compile_options target)
 
     add_supported_cxx_flags(${target} PRIVATE ${warning_flags})
 
+    # Strip the absolute source directory prefix from __FILE__ so that build-machine
+    # paths are not baked into the binary's read-only data section.
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            ${target}
+            PRIVATE "-fmacro-prefix-map=${CMAKE_SOURCE_DIR}/="
+        )
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
+        target_compile_options(
+            ${target}
+            PRIVATE "/d1trimfile:${CMAKE_SOURCE_DIR}\\"
+        )
+    endif()
+
     if(NOT WIN32)
         # these options are for ELF specific and not for Windows
         add_supported_cxx_linker_flags(
@@ -204,6 +218,8 @@ function(set_default_compile_options target)
         ${target}
         PRIVATE
             SLANG_ENABLE_DXIL_SUPPORT=$<BOOL:${SLANG_ENABLE_DXIL}>
+            SLANG_ENABLE_WEBGPU=$<BOOL:${SLANG_HAS_WEBGPU_SUPPORT}>
+            SLANG_ENABLE_VALIDATION_VM_BYTECODE=$<BOOL:${SLANG_ENABLE_VALIDATION_VM_BYTECODE}>
             $<$<BOOL:${SLANG_ENABLE_FULL_DEBUG_VALIDATION}>:SLANG_ENABLE_FULL_IR_VALIDATION>
             $<$<BOOL:${SLANG_ENABLE_IR_BREAK_ALLOC}>:SLANG_ENABLE_IR_BREAK_ALLOC>
             $<$<BOOL:${SLANG_ENABLE_DX_ON_VK}>:SLANG_CONFIG_DX_ON_VK>

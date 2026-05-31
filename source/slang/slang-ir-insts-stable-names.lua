@@ -830,5 +830,8 @@ return {
 	["DebugCompilationUnit"] = 854,
 	["IncrementCoverageCounter"] = 855,
 	["SubpassLoad"] = 856,
-	["Decoration.HasExplicitVulkanBinding"] = 857,
+	["Decoration.HasExplicitVulkanBinding"] = 860,
+	["TranslateBase.IdentityRemat"] = 857,
+	["IncrementFunctionCoverageCounter"] = 858,
+	["IncrementBranchCoverageCounter"] = 859
 }
