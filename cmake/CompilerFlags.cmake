@@ -104,6 +104,7 @@ function(set_default_compile_options target)
             -Wall
             # Disabled warnings:
             -Wno-switch
+            -Wno-unsafe-buffer-usage
             -Wno-parentheses
             -Wno-unused-local-typedefs
             -Wno-class-memaccess
