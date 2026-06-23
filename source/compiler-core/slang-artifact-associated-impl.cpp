@@ -289,6 +289,8 @@ void* ArtifactPostEmitMetadata::getInterface(const Guid& guid)
     }
     if (guid == slang::IMetadata::getTypeGuid())
         return static_cast<slang::IMetadata*>(this);
+    if (guid == slang::IBindlessResourceMetadata::getTypeGuid())
+        return static_cast<slang::IBindlessResourceMetadata*>(this);
     if (guid == slang::IBindlessResourceUsageMetadata::getTypeGuid())
         return static_cast<slang::IBindlessResourceUsageMetadata*>(this);
     if (guid == slang::ICoverageTracingMetadata::getTypeGuid())
@@ -356,6 +358,11 @@ SlangResult ArtifactPostEmitMetadata::isParameterLocationUsed(
 const char* ArtifactPostEmitMetadata::getDebugBuildIdentifier()
 {
     return m_debugBuildIdentifier.getBuffer();
+}
+
+bool ArtifactPostEmitMetadata::usesBindlessResourceHeap()
+{
+    return m_usesBindlessResourceHeap;
 }
 
 uint32_t ArtifactPostEmitMetadata::getCounterCount()
